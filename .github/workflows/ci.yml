@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Audit public working tree
+        run: ./scripts/public-release-audit.sh
+
+      - name: Install formatting tools
+        run: brew install swiftformat swiftlint
+
+      - name: Check formatting
+        run: swiftformat --lint .
+
+      - name: Run SwiftLint
+        run: swiftlint lint --strict
+
+      - name: Run Swift Package tests
+        run: swift test --no-parallel
+
+      - name: Build iOS framework
+        run: >-
+          xcodebuild
+          -project Babylon.xcodeproj
+          -scheme Babylon
+          -configuration Debug
+          -destination 'generic/platform=iOS'
+          CODE_SIGNING_ALLOWED=NO
+          build
+
+      - name: Build iOS framework (Release)
+        run: >-
+          xcodebuild
+          -project Babylon.xcodeproj
+          -scheme Babylon
+          -configuration Release
+          -destination 'generic/platform=iOS'
+          CODE_SIGNING_ALLOWED=NO
+          build

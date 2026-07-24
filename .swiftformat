@@ -1,0 +1,33 @@
+--indent 4
+--indentcase false
+--trimwhitespace always
+--voidtype void
+--nospaceoperators
+--stripunusedargs closure-only
+--maxwidth 120
+--wraparguments before-first
+--wrapparameters before-first
+--wrapcollections before-first
+--closingparen balanced
+--funcattributes prev-line
+--typeattributes prev-line
+--varattributes same-line
+--self remove
+--importgrouping testable-bottom
+--commas inline
+--semicolons never
+--linebreaks lf
+--xcodeindentation disabled
+--header ignore
+--ifdef no-indent
+--allman false
+--emptybraces no-space
+--elseposition same-line
+--guardelse same-line
+--patternlet hoist
+--redundanttype inferred
+--trailingclosures
+--shortoptionals always
+--swiftversion 5.9
+--disable modifierOrder,wrapMultilineStatementBraces
+--exclude .build,DerivedData,Pods,Carthage,.swiftpm

@@ -1,0 +1,48 @@
+# Xcode
+build/
+DerivedData/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.moved-aside
+*.xccheckout
+*.xcscmblueprint
+*.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# CocoaPods
+Pods/
+
+# Carthage
+Carthage/Build/
+Carthage/Checkouts/
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# Secrets
+*.env
+credentials.json
+*Secrets.xcconfig
+*.secrets.*
+
+# Agent tooling and private reference material (never part of the public repo)
+.agent/
+.agents/
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md
