@@ -3,8 +3,11 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9+-orange.svg)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/Platforms-iOS%2016%2B%20%7C%20macOS%2013%2B%20%7C%20tvOS%2016%2B%20%7C%20watchOS%2010%2B-lightgrey.svg)](https://github.com/RockxyApp/Babylon)
+[![Website](https://img.shields.io/badge/rockxy.io-000?logo=safari&logoColor=fff)](https://rockxy.io)
 
-Captures HTTP/HTTPS, WebSocket, gRPC, and runtime trace data from your app and sends it to [Rockxy](https://github.com/RockxyApp/Rockxy) for inspection. No proxy or certificate installation is required.
+Captures HTTP/HTTPS, WebSocket, gRPC, and runtime trace data from your app and sends it to [Rockxy](https://rockxy.io) for inspection. No proxy or certificate installation is required.
+
+Babylon is the client SDK. [Rockxy](https://rockxy.io) is the macOS app that receives and inspects the traffic — get it at **[rockxy.io](https://rockxy.io)** ([source](https://github.com/RockxyApp/Rockxy)).
 
 ## Features
 
@@ -35,6 +38,15 @@ Rockxy macOS App (via Bonjour or localhost:10909)
 ```
 
 Babylon swizzles URLSession's private connection class (`__NSCFURLSessionConnection`) to intercept traffic without requiring URLProtocol registration or proxy configuration.
+
+## Rockxy
+
+Babylon captures traffic; [Rockxy](https://rockxy.io) is the macOS app that displays it — request/response bodies, headers, timing, WebSocket frames, gRPC calls, and runtime traces, all inspectable on your desktop. No proxy, no certificate, no system settings to change.
+
+- **Download:** [rockxy.io](https://rockxy.io)
+- **Source:** [github.com/RockxyApp/Rockxy](https://github.com/RockxyApp/Rockxy)
+
+Star both repos if Babylon saves you a proxy config.
 
 ## Requirements
 
@@ -407,3 +419,7 @@ Stop Babylon, reproduce without capture, and file an issue with a symbolicated c
 ## License
 
 Babylon is released under the [Apache License 2.0](LICENSE).
+
+---
+
+Built for [Rockxy](https://rockxy.io) · [Download the app](https://rockxy.io) · [Rockxy on GitHub](https://github.com/RockxyApp/Rockxy)
