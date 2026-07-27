@@ -1,8 +1,8 @@
 # Babylon
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Swift 5.9+](https://img.shields.io/badge/Swift-5.9+-orange.svg)](https://swift.org)
-[![Platforms](https://img.shields.io/badge/Platforms-iOS%2016%2B%20%7C%20macOS%2013%2B%20%7C%20tvOS%2016%2B%20%7C%20watchOS%2010%2B-lightgrey.svg)](https://github.com/RockxyApp/Babylon)
+[![Swift versions](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2FRockxyApp%2FBabylon%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/RockxyApp/Babylon)
+[![Platforms](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2FRockxyApp%2FBabylon%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/RockxyApp/Babylon)
 [![Website](https://img.shields.io/badge/rockxy.io-000?logo=safari&logoColor=fff)](https://rockxy.io)
 
 Captures HTTP/HTTPS, WebSocket, gRPC, and runtime trace data from your app and sends it to [Rockxy](https://rockxy.io) for inspection. No proxy or certificate installation is required.
