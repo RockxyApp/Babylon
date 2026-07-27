@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Swift Package Index configuration for hosted DocC documentation and live compatibility badges
+
 ## [1.0.0] - 2026-07-24
 
 ### Added
