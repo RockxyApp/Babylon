@@ -175,9 +175,14 @@ extension NetworkInjector {
         delegate?.injectorSessionDidCreateTask(task: task, correlationContext: context)
     }
 
-    private func sessionTask(ownedBy receiver: AnyObject) -> URLSessionTask? {
-        let selector = NSSelectorFromString("task")
-        return Runtime.object(from: receiver, selector: selector, as: URLSessionTask.self)
+    /// The loading connection's task. iOS 27 and macOS 27 dropped the connection's `task` getter
+    /// but still keep the task in its `_task` instance variable, so read that when the getter is gone;
+    /// otherwise every response, body, and completion would be dropped.
+    func sessionTask(ownedBy receiver: AnyObject) -> URLSessionTask? {
+        if let task = Runtime.object(from: receiver, selector: NSSelectorFromString("task"), as: URLSessionTask.self) {
+            return task
+        }
+        return Runtime.ivarObject(from: receiver, named: "_task", as: URLSessionTask.self)
     }
 }
 

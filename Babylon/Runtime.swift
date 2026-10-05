@@ -49,6 +49,17 @@ enum Runtime {
         return getter(object, selector) as? Value
     }
 
+    /// Reads an object-typed instance variable, for private classes whose accessor was removed
+    /// while the stored reference remains. Non-object ivars are never read.
+    static func ivarObject<Value>(from object: AnyObject, named name: String, as _: Value.Type) -> Value? {
+        guard let ivar = class_getInstanceVariable(type(of: object), name),
+              let encoding = ivar_getTypeEncoding(ivar),
+              encoding.pointee == UInt8(ascii: "@") else {
+            return nil
+        }
+        return object_getIvar(object, ivar) as? Value
+    }
+
     static func getAllClasses() -> [AnyClass] {
         let reportedCount = Int(objc_getClassList(nil, 0))
         guard reportedCount > 0 else { return [] }

@@ -174,3 +174,116 @@ struct BabylonHelperTests {
         #expect(BabylonHelper.stringSelector == "string")
     }
 }
+
+// MARK: - Connection Task Resolution Tests
+
+/// iOS 27 and macOS 27 removed the loading connection's `task` getter but keep the task in its
+/// `_task` instance variable. Without the fallback every response, body, and completion is dropped.
+struct ConnectionTaskResolutionTests {
+    @Test("A connection without a task getter resolves its task from the _task instance variable")
+    func resolvesTaskFromInstanceVariable() throws {
+        let connectionClass = try #require(Self.connectionLikeClass() as? NSObject.Type)
+        let connection: AnyObject = connectionClass.init()
+        let task = try URLSession(configuration: .ephemeral)
+            .dataTask(with: #require(URL(string: "https://example.com/item")))
+        let ivar = try #require(class_getInstanceVariable(connectionClass, "_task"))
+        object_setIvarWithStrongDefault(connection, ivar, task)
+
+        #expect(!connection.responds(to: NSSelectorFromString("task")))
+        #expect(NetworkInjector().sessionTask(ownedBy: connection) === task)
+        task.cancel()
+    }
+
+    @Test("Non-object instance variables are never read as objects")
+    func ignoresNonObjectInstanceVariables() throws {
+        let connectionClass = try #require(Self.connectionLikeClass() as? NSObject.Type)
+        let connection: AnyObject = connectionClass.init()
+        #expect(Runtime.ivarObject(from: connection, named: "_count", as: URLSessionTask.self) == nil)
+        #expect(Runtime.ivarObject(from: connection, named: "_missing", as: URLSessionTask.self) == nil)
+    }
+
+    @Test("The system loading connection still exposes its task on this OS")
+    func systemConnectionExposesTask() throws {
+        // Canary for the next OS change: either the getter or the object-typed _task ivar must exist.
+        let connectionClass = try #require(NSClassFromString("__NSCFURLLocalSessionConnection"))
+        let hasGetter = connectionClass.instancesRespond(to: NSSelectorFromString("task"))
+        let ivarEncoding = class_getInstanceVariable(connectionClass, "_task")
+            .flatMap { ivar_getTypeEncoding($0) }
+            .map { String(cString: $0) }
+        #expect(hasGetter || ivarEncoding?.hasPrefix("@") == true)
+    }
+
+    private static func connectionLikeClass() -> AnyClass? {
+        let name = "BabylonTestConnectionWithoutTaskGetter"
+        if let existing = NSClassFromString(name) {
+            return existing
+        }
+        guard let created = objc_allocateClassPair(NSObject.self, name, 0) else {
+            return nil
+        }
+        _ = class_addIvar(
+            created,
+            "_task",
+            MemoryLayout<AnyObject>.size,
+            UInt8(log2(Double(MemoryLayout<AnyObject>.alignment))),
+            "@"
+        )
+        _ = class_addIvar(
+            created,
+            "_count",
+            MemoryLayout<Int>.size,
+            UInt8(log2(Double(MemoryLayout<Int>.alignment))),
+            "q"
+        )
+        objc_registerClassPair(created)
+        return created
+    }
+}
+
+// MARK: - Request Body Capture Tests
+
+/// After `resume()` URLSession moves an `httpBody` into a stream on `currentRequest`; only
+/// `originalRequest` still holds the data. A fake task models that state without resuming a real
+/// task, which would reach the live hooks and other suites' delegates.
+private final class ResumedBodyTask: URLSessionDataTask, @unchecked Sendable {
+    let current: URLRequest
+    let original: URLRequest
+
+    init(current: URLRequest, original: URLRequest) {
+        self.current = current
+        self.original = original
+        super.init()
+    }
+
+    override var currentRequest: URLRequest? {
+        current
+    }
+
+    override var originalRequest: URLRequest? {
+        original
+    }
+}
+
+struct ResumedRequestBodyTests {
+    @Test("A resumed data task still captures the body the app set")
+    func resumedTaskKeepsRequestBody() throws {
+        let body = Data(#"{"operationName":"GetUser"}"#.utf8)
+        var original = try URLRequest(url: #require(URL(string: "https://api.example.com/graphql")))
+        original.httpMethod = "POST"
+        original.httpBody = body
+        var current = original
+        current.httpBodyStream = InputStream(data: body)
+
+        let task = ResumedBodyTask(current: current, original: original)
+        let package = try #require(TrafficPackage.buildRequest(sessionTask: task, id: "resumed-body"))
+        #expect(package.request.body == body)
+    }
+
+    @Test("A request without a body stays without one")
+    func requestWithoutBodyStaysEmpty() throws {
+        let request = try URLRequest(url: #require(URL(string: "https://api.example.com/items")))
+        let task = ResumedBodyTask(current: request, original: request)
+        let package = try #require(TrafficPackage.buildRequest(sessionTask: task, id: "no-body"))
+        #expect(package.request.body == nil)
+    }
+}

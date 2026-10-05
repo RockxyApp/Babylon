@@ -13,4 +13,13 @@ extension URLSessionTask {
         #endif
         return currentRequest
     }
+
+    /// The body the app set on the request. URLSession moves an `httpBody` into a stream on
+    /// `currentRequest`, which cannot be read without consuming it; `originalRequest` keeps the data.
+    var originalRequestBodySafe: Data? {
+        #if os(iOS) || os(macOS)
+        guard !(self is AVAggregateAssetDownloadTask) else { return nil }
+        #endif
+        return originalRequest?.httpBody
+    }
 }
