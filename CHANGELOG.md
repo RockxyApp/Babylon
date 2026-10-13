@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Swift Package Index configuration for hosted DocC documentation and live compatibility badges
 
+### Fixed
+- Capture on iOS 27 and macOS 27: the system's loading connection no longer has a `task` getter, so every response, body, and completion was dropped and nothing reached Rockxy. The task is now read from the connection's stored reference when the getter is missing.
+- Request bodies set with `httpBody` are captured again after the task starts; URLSession moves them into a stream on `currentRequest`, so the body now comes from `originalRequest`.
+
 ## [1.0.0] - 2026-07-24
 
 ### Added

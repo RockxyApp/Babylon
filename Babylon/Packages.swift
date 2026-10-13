@@ -136,6 +136,9 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
 
     static func buildRequest(sessionTask: URLSessionTask, id: String) -> TrafficPackage? {
         guard let request = Request(sessionTask.currentRequestSafe) else { return nil }
+        if request.body == nil, let body = sessionTask.originalRequestBodySafe, !body.isEmpty {
+            request.appendBody(body)
+        }
         let type: PackageType = if let webSocketTaskClass = NSClassFromString("__NSURLSessionWebSocketTask"),
                                    sessionTask.isKind(of: webSocketTaskClass) {
             .websocket
