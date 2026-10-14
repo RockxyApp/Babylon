@@ -53,10 +53,10 @@ jobs:
         run: brew install swiftformat swiftlint
 
       - name: Check formatting
-        run: swiftformat --lint .
+        run: swiftformat --lint Package.swift Babylon BabylonTests
 
       - name: Run SwiftLint
-        run: swiftlint lint --strict
+        run: swiftlint lint --strict Babylon BabylonTests
 
       - name: Run Swift Package tests
         run: swift test --no-parallel
