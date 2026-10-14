@@ -21,7 +21,8 @@ let package = Package(
         .testTarget(
             name: "BabylonTests",
             dependencies: ["Babylon"],
-            path: "BabylonTests"
+            path: "BabylonTests",
+            resources: [.copy("Fixtures/RockxyProtocol")]
         )
     ]
 )

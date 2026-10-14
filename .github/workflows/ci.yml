@@ -17,6 +17,34 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
+      - name: Check out Rockxy protocol fixtures
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RockxyApp/Rockxy
+          path: rockxy
+          persist-credentials: false
+
+      - name: Use matching Rockxy branch for paired repository PRs
+        env:
+          MATCHING_BRANCH: ${{ github.event.pull_request.head.ref }}
+          SAME_REPOSITORY_PR: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          if [ "$SAME_REPOSITORY_PR" != "true" ] || [ -z "$MATCHING_BRANCH" ]; then
+            echo "Using Rockxy main"
+            exit 0
+          fi
+          git check-ref-format --branch "$MATCHING_BRANCH"
+          if git -C rockxy ls-remote --exit-code --heads origin "refs/heads/$MATCHING_BRANCH" >/dev/null; then
+            git -C rockxy fetch --no-tags --depth=1 origin "refs/heads/$MATCHING_BRANCH"
+            git -C rockxy checkout --detach FETCH_HEAD
+            echo "Using matching Rockxy branch $MATCHING_BRANCH"
+          else
+            echo "No matching Rockxy branch; using main"
+          fi
+
+      - name: Validate shared protocol fixture corpus
+        run: python3 rockxy/docs/tools/validate_babylon_fixtures.py "$GITHUB_WORKSPACE"
+
       - name: Audit public working tree
         run: ./scripts/public-release-audit.sh
 

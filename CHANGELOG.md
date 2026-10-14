@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Shared, versioned Rockxy protocol fixtures that validate connection, HTTP success/error, WebSocket, runtime, acknowledgement, and rejection payloads in SDK tests and cross-repository CI.
 - Swift Package Index configuration for hosted DocC documentation and live compatibility badges
 
 ### Fixed
