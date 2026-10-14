@@ -18,6 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # immutable commit allowed by repository policy
 
+      - name: Audit public working tree
+        run: ./scripts/public-release-audit.sh
+
       - name: Check out Rockxy protocol fixtures
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # immutable commit allowed by repository policy
         with:
@@ -45,9 +48,6 @@ jobs:
 
       - name: Validate shared protocol fixture corpus
         run: python3 rockxy/docs/tools/validate_babylon_fixtures.py "$GITHUB_WORKSPACE"
-
-      - name: Audit public working tree
-        run: ./scripts/public-release-audit.sh
 
       - name: Install formatting tools
         run: brew install swiftformat swiftlint
