@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -26,8 +27,8 @@ jobs:
 
       - name: Use matching Rockxy branch for paired repository PRs
         env:
-          MATCHING_BRANCH: ${{ github.event.pull_request.head.ref }}
-          SAME_REPOSITORY_PR: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          MATCHING_BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          SAME_REPOSITORY_PR: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           if [ "$SAME_REPOSITORY_PR" != "true" ] || [ -z "$MATCHING_BRANCH" ]; then
             echo "Using Rockxy main"
