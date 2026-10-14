@@ -236,3 +236,62 @@ struct BabylonProtocolTests {
         )
     }
 }
+
+@Suite("Shared Rockxy protocol fixtures")
+struct RockxyProtocolFixtureTests {
+    @Test("Versioned payload fixtures decode into producer and receiver models")
+    func sharedFixturesDecode() throws {
+        let directory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // BabylonTests/
+            .appendingPathComponent("Fixtures/RockxyProtocol/v1")
+        let decoder = JSONDecoder()
+        let connection = try decoder.decode(
+            ConnectionPackage.self,
+            from: Data(contentsOf: directory.appendingPathComponent("connection.json"))
+        )
+        let success = try decoder.decode(
+            TrafficPackage.self,
+            from: Data(contentsOf: directory.appendingPathComponent("traffic-success.json"))
+        )
+        let failure = try decoder.decode(
+            TrafficPackage.self,
+            from: Data(contentsOf: directory.appendingPathComponent("traffic-error.json"))
+        )
+        let websocket = try decoder.decode(
+            TrafficPackage.self,
+            from: Data(contentsOf: directory.appendingPathComponent("websocket.json"))
+        )
+        let grpc = try decoder.decode(
+            TrafficPackage.self,
+            from: Data(contentsOf: directory.appendingPathComponent("grpc.json"))
+        )
+        let runtime = try decoder.decode(
+            RuntimePackage.self,
+            from: Data(contentsOf: directory.appendingPathComponent("runtime.json"))
+        )
+
+        #expect(connection.project.bundleIdentifier == "com.example.fixture")
+        #expect(success.id == "traffic-success")
+        #expect(success.startAt == 1_725_000_000)
+        #expect(success.packageType == .http)
+        #expect(success.correlationContext?.traceId == "trace-success")
+        #expect(failure.error?.code == -1001)
+        #expect(websocket.packageType == .websocket)
+        #expect(grpc.request.method == "GRPC")
+        #expect(grpc.request.url == "/example.Greeter/SayHello")
+        #expect(grpc.request.body == Data([0x08, 0x01]))
+        #expect(grpc.responseBodyData == Data([0x08, 0x02]))
+        #expect(runtime.id == "runtime-event-1")
+        let acknowledgement = try decoder.decode(
+            BabylonProtocol.Ack.self,
+            from: Data(contentsOf: directory.appendingPathComponent("ack.json"))
+        )
+        let rejection = try decoder.decode(
+            BabylonProtocol.ProtocolError.self,
+            from: Data(contentsOf: directory.appendingPathComponent("rejection.json"))
+        )
+        #expect(acknowledgement.messageID == "traffic-success")
+        #expect(rejection.code == "unsupported_version")
+        #expect(BabylonProtocol.MessageType.allCases.map(\.rawValue).contains("ack"))
+    }
+}

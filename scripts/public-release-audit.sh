@@ -11,7 +11,7 @@ cd "$PROJECT_ROOT"
 git ls-files --cached --others --exclude-standard | while IFS= read -r path; do
     case "$path" in
         .github/*|Babylon/*|Babylon.xcodeproj/*|BabylonTests/*|docs/*|scripts/*) ;;
-        .gitignore|.swiftformat|.swiftlint.yml|CHANGELOG.md|CODE_OF_CONDUCT.md|CONTRIBUTING.md|LICENSE|Package.swift|README.md|SECURITY.md) ;;
+        .gitignore|.spi.yml|.swiftformat|.swiftlint.yml|CHANGELOG.md|CODE_OF_CONDUCT.md|CONTRIBUTING.md|LICENSE|Package.swift|README.md|SECURITY.md) ;;
         *)
             printf 'Unexpected public path: %s\n' "$path" >&2
             exit 1

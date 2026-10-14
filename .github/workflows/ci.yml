@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -15,19 +16,47 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # immutable commit allowed by repository policy
 
       - name: Audit public working tree
         run: ./scripts/public-release-audit.sh
+
+      - name: Check out Rockxy protocol fixtures
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # immutable commit allowed by repository policy
+        with:
+          repository: RockxyApp/Rockxy
+          path: rockxy
+          persist-credentials: false
+
+      - name: Use matching Rockxy branch for paired repository PRs
+        env:
+          MATCHING_BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          SAME_REPOSITORY_PR: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          if [ "$SAME_REPOSITORY_PR" != "true" ] || [ -z "$MATCHING_BRANCH" ]; then
+            echo "Using Rockxy main"
+            exit 0
+          fi
+          git check-ref-format --branch "$MATCHING_BRANCH"
+          if git -C rockxy ls-remote --exit-code --heads origin "refs/heads/$MATCHING_BRANCH" >/dev/null; then
+            git -C rockxy fetch --no-tags --depth=1 origin "refs/heads/$MATCHING_BRANCH"
+            git -C rockxy checkout --detach FETCH_HEAD
+            echo "Using matching Rockxy branch $MATCHING_BRANCH"
+          else
+            echo "No matching Rockxy branch; using main"
+          fi
+
+      - name: Validate shared protocol fixture corpus
+        run: python3 rockxy/docs/tools/validate_babylon_fixtures.py "$GITHUB_WORKSPACE"
 
       - name: Install formatting tools
         run: brew install swiftformat swiftlint
 
       - name: Check formatting
-        run: swiftformat --lint .
+        run: swiftformat --lint Package.swift Babylon BabylonTests
 
       - name: Run SwiftLint
-        run: swiftlint lint --strict
+        run: swiftlint lint --strict Babylon BabylonTests
 
       - name: Run Swift Package tests
         run: swift test --no-parallel
