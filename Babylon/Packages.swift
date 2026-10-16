@@ -23,6 +23,51 @@ protocol Serializable {
     func toData() -> Data?
 }
 
+protocol CaptureMemoryEstimating {
+    var captureMemoryEstimate: Int { get }
+}
+
+extension CaptureMemoryEstimating {
+    var captureMemoryEstimate: Int {
+        4096
+    }
+}
+
+enum CaptureString {
+    static func bounded(_ value: String, maximumBytes: Int = BabylonConstants.maximumCaptureStringBytes) -> String {
+        guard value.utf8.count > maximumBytes else { return value }
+        var result = String.UnicodeScalarView()
+        var byteCount = 0
+        for scalar in value.unicodeScalars {
+            let scalarBytes = scalar.utf8.count
+            guard byteCount + scalarBytes <= maximumBytes else { break }
+            result.append(scalar)
+            byteCount += scalarBytes
+        }
+        return String(result)
+    }
+
+    static func headers(_ headers: [Header]) -> [Header] {
+        var result: [Header] = []
+        var byteCount = 0
+        let ordered = headers.sorted {
+            let left = $0.key.lowercased()
+            let right = $1.key.lowercased()
+            return left == right ? $0.key < $1.key : left < right
+        }
+        for header in ordered.prefix(BabylonConstants.maximumCaptureHeaderCount) {
+            let key = bounded(header.key, maximumBytes: 256)
+            let remaining = BabylonConstants.maximumCaptureHeaderBytes - byteCount - key.utf8.count
+            guard remaining > 0 else { break }
+            let value = bounded(header.value, maximumBytes: min(4096, remaining))
+            byteCount += key.utf8.count + value.utf8.count
+            result.append(Header(key: key, value: value))
+            guard byteCount < BabylonConstants.maximumCaptureHeaderBytes else { break }
+        }
+        return result
+    }
+}
+
 private enum PackageEncoding {
     static let logger = Logger(subsystem: "com.amunx.Babylon", category: "CaptureModels")
     static let omittedBody = Data("<Skip Large Body>".utf8)
@@ -73,7 +118,7 @@ private enum CaptureRedaction {
     }
 }
 
-struct ConnectionPackage: Codable, Serializable {
+struct ConnectionPackage: Codable, Serializable, CaptureMemoryEstimating {
     let device: Device
     let project: Project
     let icon: Data?
@@ -83,15 +128,21 @@ struct ConnectionPackage: Codable, Serializable {
         let detectedProject = Project.current
         device = Device(name: config.deviceName, model: detectedDevice.model)
         project = Project(name: config.projectName, bundleIdentifier: detectedProject.bundleIdentifier)
-        icon = Image.appIcon?.getPNGData()
+        icon = PackageEncoding.bounded(Image.appIcon?.getPNGData(), limit: BabylonConstants.maximumCaptureIconBytes)
     }
 
     func toData() -> Data? {
         PackageEncoding.encode(self, label: "connection package")
     }
+
+    var captureMemoryEstimate: Int {
+        let stringBytes = device.name.utf8.count + device.model.utf8.count + project.name.utf8.count +
+            project.bundleIdentifier.utf8.count
+        return CaptureMemoryEstimate.retained(bodyBytes: icon?.count ?? 0, stringBytes: stringBytes)
+    }
 }
 
-public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serializable {
+public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serializable, CaptureMemoryEstimating {
     public enum PackageType: String, Codable {
         case http
         case websocket
@@ -108,6 +159,36 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
     public let packageType: PackageType
     public private(set) var correlationContext: CorrelationContext?
     private(set) var websocketMessagePackage: WebsocketMessagePackage?
+    // The runtime lease is excluded from CodingKeys; decoding must restore an unleased package.
+    // swiftlint:disable:next implicit_optional_initialization
+    private var captureMemoryLease: CaptureMemoryLease? = nil
+    private var basePayloadCache = TrafficPackageBasePayloadCache()
+    var basePayloadEncodingCount: Int {
+        basePayloadCache.encodingCount
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, startAt, request, response, error, responseBodyData, endAt, lastData
+        case packageType, correlationContext, websocketMessagePackage
+    }
+
+    var captureMemoryEstimate: Int {
+        CaptureMemoryEstimate.retained(bodyBytes: capturedBodySize, stringBytes: capturedStringSize)
+    }
+
+    private var capturedBodySize: Int {
+        PackageEncoding.capturedSize(request.body) + PackageEncoding.capturedSize(responseBodyData) +
+            (websocketMessagePackage?.capturedBodySize ?? 0)
+    }
+
+    private var capturedStringSize: Int {
+        id.utf8.count + request.url.utf8.count + request.method.utf8.count +
+            request.headers.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count } +
+            (response?.headers.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count } ?? 0) +
+            (error?.message.utf8.count ?? 0) +
+            (correlationContext.map { $0.sessionId.utf8.count + $0.traceId.utf8.count + $0.stepId.utf8.count } ?? 0) +
+            (websocketMessagePackage?.captureMemoryStringSize ?? 0)
+    }
 
     public var debugDescription: String {
         "Package: id=\(id), type=\(packageType.rawValue), hasResponse=\(response != nil)"
@@ -123,7 +204,7 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
         endAt: TimeInterval? = nil,
         correlationContext: CorrelationContext? = nil
     ) {
-        self.id = id
+        self.id = CaptureString.bounded(id, maximumBytes: 512)
         self.startAt = startAt
         self.request = request
         self.response = response
@@ -170,39 +251,82 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
     }
 
     func updateResponse(_ response: URLResponse) {
+        invalidateBasePayload()
         self.response = Response(response)
+        guard resizeCaptureLease(toBodyBytes: capturedBodySize, estimatedBytes: captureMemoryEstimate) else {
+            self.response = nil
+            if let captureMemoryLease {
+                _ = captureMemoryLease.resize(to: captureMemoryEstimate)
+            }
+            return
+        }
     }
 
     func updateDidComplete(_ error: Error?) {
+        invalidateBasePayload()
         endAt = Date().timeIntervalSince1970
         self.error = error.map(CustomError.init)
+        guard resizeCaptureLease(toBodyBytes: capturedBodySize, estimatedBytes: captureMemoryEstimate) else {
+            self.error = nil
+            if let captureMemoryLease {
+                _ = captureMemoryLease.resize(to: captureMemoryEstimate)
+            }
+            return
+        }
     }
 
     func appendRequestData(_ data: Data) {
+        invalidateBasePayload()
+        guard resizeCaptureLease(forAdditionalBodyBytes: data.count, omittingRequestOnFailure: true) else { return }
         request.appendBody(data, maximumBodySize: remainingBodyCapacity(excluding: .request))
+        if let captureMemoryLease {
+            _ = captureMemoryLease.resize(to: captureMemoryEstimate)
+        }
     }
 
     func updateStartTime(_ startTime: TimeInterval) {
+        invalidateBasePayload()
         startAt = startTime
     }
 
     func appendResponseData(_ data: Data) {
         guard responseBodyData != PackageEncoding.omittedBody else { return }
-        let limit = remainingBodyCapacity(excluding: .response)
-        guard data.count <= limit - min(limit, responseBodyData.count) else {
+        guard resizeCaptureLease(forAdditionalBodyBytes: data.count, omittingRequestOnFailure: false) else {
+            invalidateBasePayload()
             responseBodyData = PackageEncoding.omittedBody
             lastData = nil
             return
         }
+        let limit = remainingBodyCapacity(excluding: .response)
+        guard data.count <= limit - min(limit, responseBodyData.count) else {
+            invalidateBasePayload()
+            responseBodyData = PackageEncoding.omittedBody
+            lastData = nil
+            if let captureMemoryLease {
+                _ = captureMemoryLease.resize(to: captureMemoryEstimate)
+            }
+            return
+        }
+        invalidateBasePayload()
         responseBodyData.append(data)
     }
 
     func setWebsocketMessagePackage(package: WebsocketMessagePackage) {
-        websocketMessagePackage = package.bounded(maximumBodySize: remainingBodyCapacity(excluding: .webSocket))
+        let bounded = package.bounded(maximumBodySize: remainingBodyCapacity(excluding: .webSocket))
+        guard resizeCaptureLease(toBodyBytes: capturedBodySize - (websocketMessagePackage?.capturedBodySize ?? 0) +
+            bounded.capturedBodySize) else {
+            websocketMessagePackage = package.bounded(maximumBodySize: 0)
+            if let captureMemoryLease {
+                _ = captureMemoryLease.resize(to: captureMemoryEstimate)
+            }
+            return
+        }
+        websocketMessagePackage = bounded
     }
 
     func setCorrelationContext(_ context: CorrelationContext?) {
         if let context {
+            invalidateBasePayload()
             correlationContext = context
         }
     }
@@ -210,16 +334,45 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
     func toData() -> Data? {
         lastData = nil
         if responseBodyData.count > BabylonConstants.maximumBodySize {
+            invalidateBasePayload()
             responseBodyData = PackageEncoding.omittedBody
         }
         if let body = request.body,
            body == PackageEncoding.omittedBody || body.count > BabylonConstants.maximumBodySize {
+            invalidateBasePayload()
             request.resetBody()
         }
-        return PackageEncoding.encode(self, label: "traffic package")
+        guard let cachedBasePayload = basePayloadCache.payload(encode: {
+            let base = TrafficPackageBase(
+                id: id,
+                startAt: startAt,
+                request: request,
+                response: response,
+                error: error,
+                responseBodyData: responseBodyData,
+                endAt: endAt,
+                lastData: lastData,
+                packageType: packageType,
+                correlationContext: correlationContext
+            )
+            return PackageEncoding.encode(base, label: "traffic package base")
+        }) else { return nil }
+        guard let websocketMessagePackage else { return cachedBasePayload }
+        guard let encodedFrame = PackageEncoding.encode(websocketMessagePackage, label: "WebSocket package") else {
+            return nil
+        }
+        var result = cachedBasePayload
+        if result.last == UInt8(ascii: "}"), result.count > 2 {
+            result.removeLast()
+            result.append(contentsOf: ",\"websocketMessagePackage\":".utf8)
+            result.append(encodedFrame)
+            result.append(UInt8(ascii: "}"))
+        }
+        return result
     }
 
-    func makeSnapshot() -> TrafficPackage {
+    func makeSnapshot() -> TrafficPackage? {
+        guard let lease = CaptureMemoryBudget.shared.reserve(captureMemoryEstimate) else { return nil }
         let copy = TrafficPackage(
             id: id,
             request: Request(url: request.url, method: request.method, headers: request.headers, body: request.body),
@@ -232,7 +385,52 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
         )
         copy.error = error
         copy.websocketMessagePackage = websocketMessagePackage
+        copy.captureMemoryLease = lease
+        copy.basePayloadCache = basePayloadCache
         return copy
+    }
+
+    private func invalidateBasePayload() {
+        basePayloadCache = TrafficPackageBasePayloadCache()
+    }
+
+    @discardableResult
+    func admitCapture(using budget: CaptureMemoryBudget = .shared) -> Bool {
+        guard captureMemoryLease == nil else { return true }
+        guard let lease = budget.reserve(captureMemoryEstimate) else { return false }
+        captureMemoryLease = lease
+        return true
+    }
+
+    private func resizeCaptureLease(forAdditionalBodyBytes count: Int, omittingRequestOnFailure: Bool) -> Bool {
+        let additional = max(0, count)
+        let projectedBodySize = capturedBodySize + additional
+        let (projectedEstimate, estimateOverflow) = CaptureMemoryEstimate.retained(
+            bodyBytes: projectedBodySize,
+            stringBytes: capturedStringSize
+        ).addingReportingOverflow(additional)
+        let target = estimateOverflow ? Int.max : projectedEstimate
+        guard resizeCaptureLease(toBodyBytes: capturedBodySize + max(0, count), estimatedBytes: target) else {
+            if omittingRequestOnFailure {
+                request.resetBody()
+            } else {
+                responseBodyData = PackageEncoding.omittedBody
+            }
+            if let captureMemoryLease {
+                _ = captureMemoryLease.resize(to: captureMemoryEstimate)
+            }
+            return false
+        }
+        return true
+    }
+
+    private func resizeCaptureLease(toBodyBytes bodyBytes: Int, estimatedBytes: Int? = nil) -> Bool {
+        guard let captureMemoryLease else { return true }
+        let estimate = estimatedBytes ?? CaptureMemoryEstimate.retained(
+            bodyBytes: bodyBytes,
+            stringBytes: capturedStringSize
+        )
+        return captureMemoryLease.resize(to: estimate)
     }
 
     private enum BodySection {
@@ -256,6 +454,43 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
     }
 }
 
+private struct TrafficPackageBase: Encodable {
+    let id: String
+    let startAt: TimeInterval
+    let request: Request
+    let response: Response?
+    let error: CustomError?
+    let responseBodyData: Data
+    let endAt: TimeInterval?
+    let lastData: Data?
+    let packageType: TrafficPackage.PackageType
+    let correlationContext: CorrelationContext?
+}
+
+private final class TrafficPackageBasePayloadCache {
+    private let lock = NSLock()
+    private var cachedPayload: Data?
+    private var encodeCount = 0
+
+    var encodingCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return encodeCount
+    }
+
+    func payload(encode: () -> Data?) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cachedPayload {
+            return cachedPayload
+        }
+        guard let payload = encode() else { return nil }
+        cachedPayload = payload
+        encodeCount += 1
+        return payload
+    }
+}
+
 struct Device: Codable {
     var name: String
     let model: String
@@ -265,8 +500,8 @@ struct Device: Codable {
     }
 
     init(name: String, model: String) {
-        self.name = name
-        self.model = model
+        self.name = CaptureString.bounded(name, maximumBytes: 4096)
+        self.model = CaptureString.bounded(model, maximumBytes: 4096)
     }
 
     init() {
@@ -302,8 +537,8 @@ struct Project: Codable {
     }
 
     init(name: String, bundleIdentifier: String) {
-        self.name = name
-        self.bundleIdentifier = bundleIdentifier
+        self.name = CaptureString.bounded(name, maximumBytes: 4096)
+        self.bundleIdentifier = CaptureString.bounded(bundleIdentifier, maximumBytes: 512)
     }
 
     init() {
@@ -323,8 +558,8 @@ public struct Header: Codable {
     public let value: String
 
     public init(key: String, value: String) {
-        self.key = key
-        self.value = value
+        self.key = CaptureString.bounded(key, maximumBytes: 256)
+        self.value = CaptureString.bounded(value, maximumBytes: 4096)
     }
 }
 
@@ -335,19 +570,22 @@ public final class Request: Codable {
     public private(set) var body: Data?
 
     public init(url: String, method: String, headers: [Header], body: Data?) {
-        self.url = CaptureRedaction.url(url)
-        self.method = method
-        self.headers = CaptureRedaction.headers(headers)
+        self.url = CaptureString.bounded(CaptureRedaction.url(CaptureString.bounded(url)))
+        self.method = CaptureString.bounded(method, maximumBytes: 256)
+        self.headers = CaptureString.headers(CaptureRedaction.headers(CaptureString.headers(headers)))
         self.body = PackageEncoding.bounded(body, limit: BabylonConstants.maximumBodySize)
     }
 
     init?(_ source: URLRequest?) {
         guard let source else { return nil }
-        url = CaptureRedaction.url(source.url?.absoluteString ?? "-")
-        method = source.httpMethod ?? "-"
-        headers = CaptureRedaction.headers((source.allHTTPHeaderFields ?? [:]).map { name, value in
-            Header(key: name, value: value)
-        })
+        let sourceURL = CaptureString.bounded(source.url?.absoluteString ?? "-")
+        url = CaptureString.bounded(CaptureRedaction.url(sourceURL))
+        method = CaptureString.bounded(source.httpMethod ?? "-", maximumBytes: 256)
+        headers = CaptureString
+            .headers(CaptureRedaction
+                .headers(CaptureString.headers((source.allHTTPHeaderFields ?? [:]).map { name, value in
+                    Header(key: name, value: value)
+                })))
         body = source.httpBodyStream == nil
             ? PackageEncoding.bounded(source.httpBody, limit: BabylonConstants.maximumBodySize)
             : nil
@@ -374,7 +612,7 @@ public struct Response: Codable {
 
     public init(statusCode: Int, headers: [Header]) {
         self.statusCode = statusCode
-        self.headers = CaptureRedaction.headers(headers)
+        self.headers = CaptureString.headers(CaptureRedaction.headers(headers))
     }
 
     init?(_ source: URLResponse) {
@@ -405,11 +643,11 @@ public struct CustomError: Codable {
 
     init(_ error: NSError) {
         code = error.code
-        message = error.localizedDescription
+        message = CaptureString.bounded(error.localizedDescription, maximumBytes: 4096)
     }
 }
 
-public struct WebsocketMessagePackage: Codable, Serializable {
+public struct WebsocketMessagePackage: Codable, Serializable, CaptureMemoryEstimating {
     public enum MessageType: String, Codable {
         case pingPong
         case send
@@ -449,8 +687,17 @@ public struct WebsocketMessagePackage: Codable, Serializable {
         return 0
     }
 
+    var captureMemoryStringSize: Int {
+        id.utf8.count + (stringValue?.utf8.count ?? 0)
+    }
+
+    var captureMemoryEstimate: Int {
+        let strings = id.utf8.count + (stringValue?.utf8.count ?? 0)
+        return CaptureMemoryEstimate.retained(bodyBytes: capturedBodySize, stringBytes: strings)
+    }
+
     init(id: String, message: Message, messageType: MessageType) {
-        self.id = id
+        self.id = CaptureString.bounded(id, maximumBytes: 512)
         createdAt = Date().timeIntervalSince1970
         self.messageType = messageType
         switch message {
@@ -464,7 +711,7 @@ public struct WebsocketMessagePackage: Codable, Serializable {
     }
 
     init(id: String, closeCode: Int, reason: Data?) {
-        self.id = id
+        self.id = CaptureString.bounded(id, maximumBytes: 512)
         createdAt = Date().timeIntervalSince1970
         messageType = .sendCloseMessage
         stringValue = String(closeCode)

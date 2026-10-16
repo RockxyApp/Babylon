@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared, versioned Rockxy protocol fixtures that validate connection, HTTP success/error, WebSocket, runtime, acknowledgement, and rejection payloads in SDK tests and cross-repository CI.
 - Swift Package Index configuration for hosted DocC documentation and live compatibility badges
 - Task-scoped trace correlation with explicit context propagation for detached tasks and callbacks
+- Shared byte-budgeted capture, encoding, and encrypted transport buffers with bounded metadata and deterministic overload drops
 
 ### Fixed
 - Capture on iOS 27 and macOS 27: the system's loading connection no longer has a `task` getter, so every response, body, and completion was dropped and nothing reached Rockxy. The task is now read from the connection's stored reference when the getter is missing.

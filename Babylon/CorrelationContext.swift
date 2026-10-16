@@ -16,9 +16,9 @@ public struct CorrelationContext: Codable, Equatable, Sendable {
         stepId: String,
         createdAt: TimeInterval = Date().timeIntervalSince1970
     ) {
-        self.sessionId = sessionId
-        self.traceId = traceId
-        self.stepId = stepId
+        self.sessionId = CaptureString.bounded(sessionId, maximumBytes: 512)
+        self.traceId = CaptureString.bounded(traceId, maximumBytes: 512)
+        self.stepId = CaptureString.bounded(stepId, maximumBytes: 512)
         self.createdAt = createdAt
     }
 

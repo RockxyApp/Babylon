@@ -7,7 +7,7 @@ import os
 private let runtimePackageLogger = Logger(subsystem: "com.amunx.Babylon", category: "RuntimePackage")
 
 /// A runtime timeline event sent to Rockxy independently from HTTP/WebSocket traffic.
-struct RuntimePackage: Codable, Serializable {
+struct RuntimePackage: Codable, Serializable, CaptureMemoryEstimating {
     enum Kind: String, Codable {
         case sessionStarted
         case sessionFinished
@@ -50,11 +50,11 @@ struct RuntimePackage: Codable, Serializable {
     ) {
         id = UUID().uuidString
         self.kind = kind
-        self.sessionId = sessionId
-        self.traceId = traceId
-        self.stepId = stepId
-        self.parentStepId = parentStepId
-        self.name = name
+        self.sessionId = CaptureString.bounded(sessionId, maximumBytes: 512)
+        self.traceId = traceId.map { CaptureString.bounded($0, maximumBytes: 512) }
+        self.stepId = stepId.map { CaptureString.bounded($0, maximumBytes: 512) }
+        self.parentStepId = parentStepId.map { CaptureString.bounded($0, maximumBytes: 512) }
+        self.name = CaptureString.bounded(name, maximumBytes: 4096)
         self.createdAt = createdAt
         self.startedAt = startedAt
         self.endedAt = endedAt
@@ -87,28 +87,42 @@ struct RuntimePackage: Codable, Serializable {
             return nil
         }
     }
+
+    var captureMemoryEstimate: Int {
+        let stringBytes = id.utf8.count + sessionId.utf8.count + (traceId?.utf8.count ?? 0) +
+            (stepId?.utf8.count ?? 0) + (parentStepId?.utf8.count ?? 0) + name.utf8.count +
+            metadata.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count } +
+            (error?.message.utf8.count ?? 0)
+        return CaptureMemoryEstimate.retained(bodyBytes: 0, stringBytes: stringBytes)
+    }
 }
 
 enum RuntimeMetadata {
     static let maximumPairCount = 64
     static let maximumKeyLength = 128
     static let maximumValueLength = 4096
+    static let maximumTotalBytes = 32768
 
     static func sanitized(_ metadata: [String: String]) -> [String: String] {
         var sanitized: [String: String] = [:]
         sanitized.reserveCapacity(min(metadata.count, maximumPairCount))
 
+        var totalBytes = 0
         for key in metadata.keys.sorted() {
             guard sanitized.count < maximumPairCount else {
                 break
             }
 
-            let trimmedKey = String(key.prefix(maximumKeyLength))
+            let trimmedKey = CaptureString.bounded(key, maximumBytes: maximumKeyLength)
             guard !trimmedKey.isEmpty else {
                 continue
             }
-            let value = metadata[key] ?? ""
-            sanitized[trimmedKey] = String(value.prefix(maximumValueLength))
+            let remaining = maximumTotalBytes - totalBytes - trimmedKey.utf8.count
+            guard remaining > 0 else { break }
+            let value = CaptureString.bounded(metadata[key] ?? "", maximumBytes: min(maximumValueLength, remaining))
+            sanitized[trimmedKey] = value
+            totalBytes += trimmedKey.utf8.count + value.utf8.count
+            guard totalBytes < maximumTotalBytes else { break }
         }
 
         return sanitized

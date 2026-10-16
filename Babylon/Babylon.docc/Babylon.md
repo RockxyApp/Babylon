@@ -4,7 +4,7 @@ Capture application network traffic and runtime timeline events for inspection i
 
 ## Overview
 
-Babylon observes URLSession traffic in debug builds, captures bounded request and response data, and sends authenticated encrypted frames to a paired Rockxy instance. It can also deliver packages to an in-process ``BabylonDelegate`` without opening a network connection.
+Babylon observes URLSession traffic in debug builds, captures bounded request and response data, and sends authenticated encrypted frames to a paired Rockxy instance. Capture, encoding, and pending transport data share a finite in-memory budget; when that budget is exhausted, Babylon omits new diagnostic data while allowing the application's original network request to proceed. It can also deliver packages to an in-process ``BabylonDelegate`` without opening a network connection.
 
 Wrap activation in `#if DEBUG`, obtain a pairing token from Rockxy, and start Babylon during application initialization:
 

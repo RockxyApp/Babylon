@@ -423,7 +423,15 @@ private extension NetServiceTransport {
 
     func transmit(_ frame: WireProtocolCodec.Frame, on connection: NWConnection) {
         guard connection.state == .ready else { return }
-        connection.send(content: frame.data, completion: .contentProcessed { [weak self] error in
+        let byteCount = frame.header.count + frame.payload.count
+        let reservation = CaptureMemoryEstimate.retained(bodyBytes: byteCount, stringBytes: 0)
+        guard let sendLease = CaptureMemoryBudget.shared.reserve(reservation) else {
+            logger.info("Encrypted frame transmission omitted after the shared memory budget was reached")
+            return
+        }
+        let data = frame.data
+        connection.send(content: data, completion: .contentProcessed { [weak self, sendLease] error in
+            _ = sendLease
             if let error {
                 self?.logger.error("Encrypted frame send failed: \(error.localizedDescription)")
             }
