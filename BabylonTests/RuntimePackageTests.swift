@@ -44,8 +44,11 @@ struct RuntimePackageTests {
 
         let sanitized = RuntimeMetadata.sanitized(metadata)
 
-        #expect(sanitized.count == RuntimeMetadata.maximumPairCount)
-        #expect(sanitized.keys.allSatisfy { $0.count <= RuntimeMetadata.maximumKeyLength })
-        #expect(sanitized.values.allSatisfy { $0.count <= RuntimeMetadata.maximumValueLength })
+        #expect(sanitized.count <= RuntimeMetadata.maximumPairCount)
+        #expect(sanitized.keys.allSatisfy { $0.utf8.count <= RuntimeMetadata.maximumKeyLength })
+        #expect(sanitized.values.allSatisfy { $0.utf8.count <= RuntimeMetadata.maximumValueLength })
+        #expect(sanitized.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count } <=
+            RuntimeMetadata.maximumTotalBytes)
+        #expect(RuntimeMetadata.sanitized(metadata) == sanitized)
     }
 }

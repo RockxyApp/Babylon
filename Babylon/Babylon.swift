@@ -17,6 +17,7 @@ private final class CaptureLedger {
     var generation: UInt64 = 0
     var traffic: [String: TrafficPackage] = [:]
     var deferredFrames: [String: [WebsocketMessagePackage]] = [:]
+    var deferredFrameLeases: [String: [CaptureMemoryLease]] = [:]
     var ignored: Set<String> = []
     var startedAt: [String: TimeInterval] = [:]
     var taskGeneration: [String: UInt64] = [:]
@@ -29,6 +30,7 @@ private final class CaptureLedger {
     func clear() {
         traffic.removeAll()
         deferredFrames.removeAll()
+        deferredFrameLeases.removeAll()
         ignored.removeAll()
         startedAt.removeAll()
         taskGeneration.removeAll()
@@ -48,16 +50,19 @@ private final class CaptureLedger {
         var frames = deferredFrames[id, default: []]
         let currentSize = frames.reduce(0) { $0 + $1.capturedBodySize }
         guard frames.count < BabylonConstants.maxPendingItems,
-              frame.capturedBodySize <= BabylonConstants.maximumBodySize - currentSize else {
+              frame.capturedBodySize <= BabylonConstants.maximumBodySize - currentSize,
+              let lease = CaptureMemoryBudget.shared.reserve(frame.captureMemoryEstimate) else {
             return
         }
         frames.append(frame)
         deferredFrames[id] = frames
+        deferredFrameLeases[id, default: []].append(lease)
     }
 
     func forget(_ id: String) {
         traffic.removeValue(forKey: id)
         deferredFrames.removeValue(forKey: id)
+        deferredFrameLeases.removeValue(forKey: id)
         taskGeneration.removeValue(forKey: id)
         ignored.remove(id)
         startedAt.removeValue(forKey: id)
@@ -96,7 +101,8 @@ public final class Babylon: NSObject {
     private var transporter: Transporter
     private var injector: Injector = NetworkInjector()
     private let ledger = CaptureLedger()
-    private let encodingQueue = DispatchQueue(label: "com.amunx.babylon.encoding", qos: .utility)
+    let encodingQueue = BoundedCaptureWorkQueue(label: "com.amunx.babylon.encoding")
+    private let encodingGeneration = Atomic<UInt64>(0)
     private let activeClientID = Atomic<String>("")
     private var ignoredProtocolClasses: [AnyClass] = []
     private let transportEnabled = Atomic<Bool>(true)
@@ -183,6 +189,7 @@ public final class Babylon: NSObject {
         }
         instance.startSendingRuntimeMessages(packages: closingMessages)
         _ = instance.activeClientID.exchange("")
+        instance.invalidateEncodingWork()
         instance.transporter.stop()
         instance.queue.async {
             instance.configuration = .default()
@@ -312,6 +319,11 @@ extension Babylon {
         created.setCorrelationContext(traceContextStore.correlationContext(forPackageId: id))
         if isIgnored(request, from: task) {
             ledger.ignored.insert(id)
+            return nil
+        }
+        guard created.admitCapture() else {
+            ledger.ignored.insert(id)
+            Babylon.logger.info("Capture omitted after the shared memory budget was reached")
             return nil
         }
         ledger.traffic[id] = created
@@ -521,6 +533,7 @@ extension Babylon {
         guard transportEnabled.value else { return }
         guard let frames = ledger.deferredFrames.removeValue(forKey: id),
               let parent = ledger.traffic[id] else { return }
+        ledger.deferredFrameLeases.removeValue(forKey: id)
         for frame in frames {
             parent.setWebsocketMessagePackage(package: frame)
             enqueueTrafficSnapshot(parent, type: .websocket)
@@ -529,10 +542,12 @@ extension Babylon {
 
     private func enqueueTrafficSnapshot(_ package: TrafficPackage, type: Message.MessageType) {
         let clientID = activeClientID.value
+        let generation = encodingGeneration.value
         guard !clientID.isEmpty else { return }
-        let snapshot = package.makeSnapshot()
-        encodingQueue.async { [weak self] in
+        guard let snapshot = package.makeSnapshot() else { return }
+        guard encodingQueue.enqueue({ [weak self] in
             guard let self,
+                  encodingGeneration.value == generation,
                   transportEnabled.value,
                   activeClientID.value == clientID else { return }
             let message: Message? = switch type {
@@ -547,8 +562,13 @@ extension Babylon {
                  .error:
                 nil
             }
-            guard let message, activeClientID.value == clientID else { return }
+            guard let message,
+                  encodingGeneration.value == generation,
+                  activeClientID.value == clientID else { return }
             transporter.send(package: message)
+        }) else {
+            Babylon.logger.info("Capture omitted because the encoding queue is full")
+            return
         }
     }
 
@@ -571,6 +591,11 @@ extension Babylon {
 }
 
 private extension Babylon {
+    func invalidateEncodingWork() {
+        encodingGeneration.mutate { $0 &+= 1 }
+        encodingQueue.clear()
+    }
+
     func observeMemoryPressure() {
         #if os(iOS)
         NotificationCenter.default.addObserver(
@@ -588,6 +613,7 @@ private extension Babylon {
             guard let self else { return }
             ledger.traffic.keys.forEach { self.traceContextStore.removeCorrelationContext(forPackageId: $0) }
             ledger.clear()
+            invalidateEncodingWork()
             Babylon.logger.info("Cleared in-flight captures after a memory warning")
         }
     }

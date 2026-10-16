@@ -2,6 +2,10 @@ import Foundation
 import Testing
 @testable import Babylon
 
+#if os(macOS)
+import Darwin
+#endif
+
 #if os(iOS)
 import UIKit
 #endif
@@ -128,7 +132,7 @@ struct CaptureHardeningTests {
             message: .string("first"),
             messageType: .send
         ))
-        let snapshot = package.makeSnapshot()
+        let snapshot = try #require(package.makeSnapshot())
 
         package.setWebsocketMessagePackage(package: WebsocketMessagePackage(
             id: "snapshot",
@@ -138,9 +142,232 @@ struct CaptureHardeningTests {
 
         let data = try #require(snapshot.toData())
         let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let encodedReference = try JSONEncoder().encode(snapshot)
+        let referenceJSON = try #require(JSONSerialization.jsonObject(with: encodedReference) as? [String: Any])
+        #expect(NSDictionary(dictionary: json).isEqual(to: referenceJSON))
         let frame = try #require(json["websocketMessagePackage"] as? [String: Any])
         #expect(frame["stringValue"] as? String == "first")
+        #expect(package.basePayloadEncodingCount == 1)
+
+        package.setWebsocketMessagePackage(package: WebsocketMessagePackage(
+            id: "snapshot",
+            message: .string("third"),
+            messageType: .send
+        ))
+        let nextSnapshot = try #require(package.makeSnapshot())
+        let nextData = try #require(nextSnapshot.toData())
+        let nextJSON = try #require(JSONSerialization.jsonObject(with: nextData) as? [String: Any])
+        let nextFrame = try #require(nextJSON["websocketMessagePackage"] as? [String: Any])
+        #expect(nextFrame["stringValue"] as? String == "third")
+        #expect(package.basePayloadEncodingCount == 1)
     }
+
+    @Test("Shared capture memory leases bound retained package pressure and release on drop")
+    func sharedMemoryBudgetBoundsRetainedPackages() {
+        let budget = CaptureMemoryBudget(limit: 16 * 1024 * 1024)
+        var retained: [TrafficPackage] = []
+        var rejected = 0
+        #if os(macOS)
+        let initialPeakRSS = residentPeakBytes()
+        #endif
+
+        for index in 0 ..< 8 {
+            let body = Data(repeating: UInt8(index), count: 6 * 1024 * 1024)
+            let request = Request(url: "https://example.com/\(index)", method: "POST", headers: [], body: body)
+            let package = TrafficPackage(id: "stress-\(index)", request: request)
+            if package.admitCapture(using: budget) {
+                retained.append(package)
+            } else {
+                rejected += 1
+            }
+        }
+
+        let peak = budget.snapshot
+        #expect(peak.usedBytes <= peak.limitBytes)
+        #expect(peak.highWaterBytes <= peak.limitBytes)
+        #expect(peak.droppedReservations == rejected)
+        #expect(rejected > 0)
+        #expect(retained.count <= 2)
+        #if os(macOS)
+        let peakRSSGrowth = max(0, residentPeakBytes() - initialPeakRSS)
+        #expect(peakRSSGrowth < 80 * 1024 * 1024)
+        #endif
+
+        retained.removeAll()
+        #expect(budget.snapshot.usedBytes == 0)
+    }
+
+    @Test("Capture budget refuses an over-limit stage and resizes leases atomically")
+    func captureBudgetAdmissionAndResize() throws {
+        let budget = CaptureMemoryBudget(limit: 1024)
+        let first = try #require(budget.reserve(700))
+        #expect(budget.reserve(400) == nil)
+        #expect(first.resize(to: 900))
+        #expect(!first.resize(to: 1100))
+        #expect(budget.snapshot.usedBytes == 900)
+        #expect(budget.snapshot.droppedReservations == 2)
+        #expect(first.resize(to: 300))
+        #expect(budget.snapshot.usedBytes == 300)
+    }
+
+    @Test("Encrypted frames keep the capture lease until the frame is released")
+    func encryptedFrameRetainsSharedCaptureLease() throws {
+        let budget = CaptureMemoryBudget.shared
+        let initialBytes = budget.snapshot.usedBytes
+        func makeFrame() throws -> BabylonProtocol.EncodedFrame {
+            var package: TrafficPackage? = TrafficPackage(
+                id: "budgeted-frame",
+                request: Request(
+                    url: "https://example.com",
+                    method: "POST",
+                    headers: [],
+                    body: Data(repeating: 0x61, count: 1024)
+                )
+            )
+            #expect(package?.admitCapture() == true)
+
+            let snapshot = try #require(package?.makeSnapshot())
+            let message = try #require(Message.buildTrafficMessage(id: "budgeted-client", item: snapshot))
+            let frame = try BabylonProtocol.encode(
+                message: message,
+                configuration: .default(authToken: testPairingToken),
+                sequence: 1,
+                messageID: "budgeted-frame",
+                nonce: Data(repeating: 0x61, count: 12)
+            )
+            package = nil
+            return frame
+        }
+
+        var frame: BabylonProtocol.EncodedFrame? = try makeFrame()
+        #expect(frame?.captureMemoryLease != nil)
+        #expect(budget.snapshot.usedBytes > initialBytes)
+
+        frame = nil
+        #expect(budget.snapshot.usedBytes == initialBytes)
+    }
+
+    @Test("Encoder work queue drops overload and clears pending leases")
+    func boundedEncoderQueueDropsAndClearsPendingWork() throws {
+        let workQueue = BoundedCaptureWorkQueue(label: "com.amunx.babylon.tests.capture", maximumItems: 2)
+        let budget = CaptureMemoryBudget(limit: 1024)
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let completed = DispatchSemaphore(value: 0)
+        #expect(workQueue.enqueue {
+            started.signal()
+            _ = release.wait(timeout: .now() + 2)
+            completed.signal()
+        })
+        #expect(started.wait(timeout: .now() + 2) == .success)
+        do {
+            let lease = try #require(budget.reserve(256))
+            #expect(workQueue.enqueue { withExtendedLifetime(lease) {} })
+        }
+        do {
+            let lease = try #require(budget.reserve(256))
+            #expect(workQueue.enqueue { withExtendedLifetime(lease) {} })
+        }
+        #expect(!workQueue.enqueue {})
+        #expect(workQueue.pendingCount == 2)
+        #expect(workQueue.droppedWorkCount == 1)
+        #expect(budget.snapshot.usedBytes == 512)
+
+        workQueue.clear()
+        #expect(workQueue.pendingCount == 0)
+        #expect(workQueue.droppedWorkCount == 3)
+        #expect(budget.snapshot.usedBytes == 0)
+        release.signal()
+        #expect(completed.wait(timeout: .now() + 2) == .success)
+    }
+
+    @Test("Capture strings and headers are bounded by UTF-8 bytes")
+    func captureStringsRespectByteBounds() {
+        let emoji = String(repeating: "🧪", count: 10000)
+        let request = Request(
+            url: "https://example.com/\(emoji)",
+            method: "GET",
+            headers: (0 ..< 200).map { Header(key: "x-\($0)", value: emoji) },
+            body: nil
+        )
+
+        #expect(request.url.utf8.count <= BabylonConstants.maximumCaptureStringBytes)
+        #expect(request.headers.count <= BabylonConstants.maximumCaptureHeaderCount)
+        #expect(request.headers.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count } <=
+            BabylonConstants.maximumCaptureHeaderBytes)
+        #expect(request.headers.allSatisfy { $0.value.utf8.count <= 4096 })
+
+        let runtime = RuntimePackage(
+            kind: .event,
+            sessionId: emoji,
+            traceId: emoji,
+            name: emoji,
+            metadata: Dictionary(uniqueKeysWithValues: (0 ..< 80).map { ("key-\($0)", emoji) })
+        )
+        let metadataBytes = runtime.metadata.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count }
+        #expect(runtime.sessionId.utf8.count <= 512)
+        #expect((runtime.traceId?.utf8.count ?? 0) <= 512)
+        #expect(runtime.name.utf8.count <= 4096)
+        #expect(metadataBytes <= RuntimeMetadata.maximumTotalBytes)
+
+        let correlation = CorrelationContext(sessionId: emoji, traceId: emoji, stepId: emoji)
+        #expect(correlation.sessionId.utf8.count <= 512)
+        #expect(correlation.traceId.utf8.count <= 512)
+        #expect(correlation.stepId.utf8.count <= 512)
+    }
+
+    @Test("Response metadata that exceeds the remaining capture budget is omitted")
+    func responseMetadataRespectsRemainingCaptureBudget() {
+        let budget = CaptureMemoryBudget(limit: 8192)
+        let package = TrafficPackage(
+            id: "bounded-response",
+            request: Request(url: "https://example.com", method: "GET", headers: [], body: nil)
+        )
+        #expect(package.admitCapture(using: budget))
+        let retainedBytes = budget.snapshot.usedBytes
+        guard let response = HTTPURLResponse(
+            url: URL(filePath: "/"),
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["X-Large": String(repeating: "x", count: 16000)]
+        ) else {
+            Issue.record("Unable to create the HTTP response fixture")
+            return
+        }
+
+        package.updateResponse(response)
+
+        #expect(package.response == nil)
+        #expect(budget.snapshot.usedBytes == retainedBytes)
+    }
+
+    @Test("Correlation metadata is omitted when it exceeds the remaining capture budget")
+    func correlationMetadataRespectsRemainingCaptureBudget() {
+        let budget = CaptureMemoryBudget(limit: 9000)
+        let package = TrafficPackage(
+            id: "bounded-correlation",
+            request: Request(url: "https://example.com", method: "GET", headers: [], body: nil)
+        )
+        #expect(package.admitCapture(using: budget))
+        let retainedBytes = budget.snapshot.usedBytes
+
+        package.setCorrelationContext(CorrelationContext(
+            sessionId: String(repeating: "s", count: 512),
+            traceId: String(repeating: "t", count: 512),
+            stepId: String(repeating: "p", count: 512)
+        ))
+
+        #expect(package.correlationContext == nil)
+        #expect(budget.snapshot.usedBytes == retainedBytes)
+    }
+
+    #if os(macOS)
+    private func residentPeakBytes() -> Int {
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else { return 0 }
+        return Int(usage.ru_maxrss)
+    }
+    #endif
 
     #if os(iOS)
     @Test("Memory warnings discard in-flight traffic packages")

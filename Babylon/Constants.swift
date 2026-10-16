@@ -11,6 +11,21 @@ enum BabylonConstants {
     /// Maximum body size before truncation (50 MB).
     static let maximumBodySize = 52_428_800
 
+    /// Shared ceiling for capture data retained across capture, encoding, and transport stages.
+    static let maximumCaptureMemoryBytes = 536_870_912
+
+    /// Maximum encoded UTF-8 bytes retained for any one captured string.
+    static let maximumCaptureStringBytes = 16384
+
+    /// Maximum headers retained on a captured request or response.
+    static let maximumCaptureHeaderCount = 128
+
+    /// Maximum aggregate UTF-8 bytes retained in captured headers.
+    static let maximumCaptureHeaderBytes = 65536
+
+    /// Maximum encoded application icon retained in a connection capture.
+    static let maximumCaptureIconBytes = 1_048_576
+
     /// Current framework version sent in wire protocol messages.
     static let buildVersion = "1.0.0"
 

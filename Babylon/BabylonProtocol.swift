@@ -12,6 +12,7 @@ enum BabylonProtocol {
     static let maximumMessageIDSize = 128
     static let maximumSessionIDSize = 128
     static let maximumClientIDSize = 512
+    static let maximumProtocolErrorBytes = 4096
 
     enum MessageType: String, Codable, CaseIterable {
         case connection
@@ -56,6 +57,13 @@ enum BabylonProtocol {
     struct ProtocolError: Codable, Equatable {
         let code: String
         let message: String
+
+        init(code: String, message: String) {
+            self.code = CaptureString.bounded(code, maximumBytes: 128)
+            self.message = CaptureString.bounded(message, maximumBytes: Self.maximumMessageBytes)
+        }
+
+        private static let maximumMessageBytes = BabylonProtocol.maximumProtocolErrorBytes
     }
 
     struct DecodedMessage {
@@ -67,6 +75,7 @@ enum BabylonProtocol {
         let messageID: String
         let header: Data
         let payload: Data
+        var captureMemoryLease: CaptureMemoryLease?
 
         var data: Data {
             var result = Data(capacity: header.count + payload.count)
@@ -102,13 +111,15 @@ enum BabylonProtocol {
             throw CodecError.compressionFailed
         }
         let payload = PayloadEnvelope(messageType: message.payloadType, sentAt: sentAt, content: content)
-        return try encode(
+        var frame = try encode(
             payload: payload,
             configuration: configuration,
             sequence: sequence,
             messageID: messageID,
             nonce: nonce
         )
+        frame.captureMemoryLease = message.captureMemoryLease
+        return frame
     }
 
     static func encode(
