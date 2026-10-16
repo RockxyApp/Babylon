@@ -12,7 +12,15 @@ import UIKit
 protocol Transporter {
     func start(_ config: Configuration)
     func stop()
+    func stop(afterSending packages: [Serializable], deadline: TimeInterval)
     func send(package: Serializable)
+}
+
+extension Transporter {
+    func stop(afterSending packages: [Serializable], deadline: TimeInterval) {
+        packages.forEach(send(package:))
+        stop()
+    }
 }
 
 enum WireProtocolCodec {
@@ -70,34 +78,86 @@ enum WireProtocolCodec {
     }
 }
 
-private struct RetainedFrame {
+struct RetainedFrame {
     let encoded: WireProtocolCodec.Frame
+    let createdAt: TimeInterval
     var retries = 0
 }
 
-private final class TransportState {
+struct PendingDelivery {
+    let package: Serializable
+    let enqueuedAt: TimeInterval
+    let estimatedBytes: Int
+}
+
+final class TransportState {
     var configuration: Configuration?
     var epoch: UInt64 = 0
     var sequence: UInt64 = 0
-    var simulatorAttempts = 0
-    var pending: [Serializable] = []
+    var pending: [PendingDelivery] = []
+    var pendingBytes = 0
     var connections: [NWConnection] = []
     var accumulators: [ObjectIdentifier: ProtocolFrameAccumulator] = [:]
+    var intentionallyCancelledConnections: Set<ObjectIdentifier> = []
     var inboundIDs = ProtocolMessageDeduplicator()
     var retained: [String: RetainedFrame] = [:]
     var retainedOrder: [String] = []
     var retainedBytes = 0
+    var endpointRetryWindows: [NWEndpoint: BoundedRetryWindow] = [:]
+    var endpointRetryTokens: [NWEndpoint: UUID] = [:]
+    var discoveredEndpoints: Set<NWEndpoint> = []
+    var discoveryRetryWindow: BoundedRetryWindow?
+    var discoveryRetryToken: UUID?
+    var drainPending: [Serializable] = []
+    var drainingMessageIDs: Set<String> = []
+    var drainDeadlineToken: UUID?
+    var isDraining = false
 
     func nextSequence() -> UInt64 {
         defer { sequence &+= 1 }
         return sequence
     }
 
-    func enqueue(_ package: Serializable) {
+    func enqueue(_ package: Serializable, now: TimeInterval) {
+        pending.removeAll { delivery in
+            let expired = now - delivery.enqueuedAt >= BabylonConstants.maximumPendingLifetime
+            if expired {
+                pendingBytes -= delivery.estimatedBytes
+            }
+            return expired
+        }
+        let estimatedBytes = Self.estimatedSize(package)
+        guard estimatedBytes <= BabylonConstants.maximumPendingBytes else { return }
         if pending.count >= BabylonConstants.maxPendingItems {
+            let removed = pending.prefix(pending.count - BabylonConstants.maxPendingItems + 1)
+            pendingBytes -= removed.reduce(0) { $0 + $1.estimatedBytes }
             pending.removeFirst(pending.count - BabylonConstants.maxPendingItems + 1)
         }
-        pending.append(package)
+        while pendingBytes + estimatedBytes > BabylonConstants.maximumPendingBytes, !pending.isEmpty {
+            pendingBytes -= pending.removeFirst().estimatedBytes
+        }
+        pending.append(PendingDelivery(package: package, enqueuedAt: now, estimatedBytes: estimatedBytes))
+        pendingBytes += estimatedBytes
+    }
+
+    func boundedDrainPackages(_ packages: [Serializable]) -> [Serializable] {
+        var selected: [Serializable] = []
+        var bytes = 0
+        for package in packages.suffix(BabylonConstants.maxPendingItems).reversed() {
+            let packageBytes = Self.estimatedSize(package)
+            guard packageBytes <= BabylonConstants.maximumPendingBytes,
+                  bytes <= BabylonConstants.maximumPendingBytes - packageBytes else { continue }
+            selected.append(package)
+            bytes += packageBytes
+        }
+        return Array(selected.reversed())
+    }
+
+    private static func estimatedSize(_ package: Serializable) -> Int {
+        if let estimatedPackage = package as? CaptureMemoryEstimating {
+            return estimatedPackage.captureMemoryEstimate
+        }
+        return package.toData()?.count ?? BabylonConstants.maximumPendingBytes
     }
 
     func detach(_ connection: NWConnection) {
@@ -105,10 +165,13 @@ private final class TransportState {
         accumulators.removeValue(forKey: ObjectIdentifier(connection))
     }
 
-    func removeRetained(_ messageID: String) {
-        guard let frame = retained.removeValue(forKey: messageID) else { return }
+    @discardableResult
+    func removeRetained(_ messageID: String) -> Bool {
+        guard let frame = retained.removeValue(forKey: messageID) else { return false }
         retainedOrder.removeAll { $0 == messageID }
         retainedBytes -= frame.encoded.payload.count
+        drainingMessageIDs.remove(messageID)
+        return true
     }
 
     func clearNetworkState(clearPending: Bool) {
@@ -119,10 +182,20 @@ private final class TransportState {
         retained.removeAll()
         retainedOrder.removeAll()
         retainedBytes = 0
-        simulatorAttempts = 0
+        intentionallyCancelledConnections.removeAll()
+        endpointRetryWindows.removeAll()
+        endpointRetryTokens.removeAll()
+        discoveredEndpoints.removeAll()
+        discoveryRetryWindow = nil
+        discoveryRetryToken = nil
+        drainPending.removeAll()
+        drainingMessageIDs.removeAll()
+        drainDeadlineToken = nil
+        isDraining = false
         configuration = nil
         if clearPending {
             pending.removeAll()
+            pendingBytes = 0
         }
     }
 }
@@ -133,11 +206,28 @@ final class NetServiceTransport: NSObject, Transporter {
     private let state = TransportState()
     private var browser: NWBrowser?
 
-    private let maximumSimulatorAttempts = 5
+    private let reconnectPolicy: BoundedRetryPolicy
+    private let discoveryRetryPolicy: BoundedRetryPolicy
     private let acknowledgementDelay: TimeInterval = 2
     private let maximumAcknowledgementRetries = 2
+    private let maximumAcknowledgementLifetime: TimeInterval = 10
 
-    override init() {
+    init(
+        reconnectPolicy: BoundedRetryPolicy = BoundedRetryPolicy(
+            maximumAttempts: 6,
+            maximumLifetime: 90,
+            initialDelay: 0.5,
+            maximumDelay: 12
+        ),
+        discoveryRetryPolicy: BoundedRetryPolicy = BoundedRetryPolicy(
+            maximumAttempts: 5,
+            maximumLifetime: 120,
+            initialDelay: 1,
+            maximumDelay: 20
+        )
+    ) {
+        self.reconnectPolicy = reconnectPolicy
+        self.discoveryRetryPolicy = discoveryRetryPolicy
         super.init()
         observeMemoryPressure()
     }
@@ -163,10 +253,40 @@ final class NetServiceTransport: NSObject, Transporter {
             #if targetEnvironment(simulator)
             connectSimulator(epoch: state.epoch)
             #else
+            state.discoveryRetryWindow = BoundedRetryWindow(startedAt: Date().timeIntervalSince1970)
             browseForDesktop()
             #endif
         }
         #endif
+    }
+
+    func startForTesting(_ config: Configuration, endpoint: NWEndpoint) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            state.epoch &+= 1
+            shutDown(clearPending: false)
+            state.configuration = config
+            state.sequence = 0
+            state.discoveredEndpoints.insert(endpoint)
+            guard config.hasValidAuthentication else { return }
+            attach(NWConnection(to: endpoint, using: .tcp), epoch: state.epoch)
+        }
+    }
+
+    func updateDiscoveredEndpointForTesting(_ endpoint: NWEndpoint, discovered: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if discovered {
+                state.discoveredEndpoints.insert(endpoint)
+                connectIfEligible(endpoint)
+            } else {
+                disconnect(endpoint)
+            }
+        }
+    }
+
+    func hasScheduledRetryForTesting(_ endpoint: NWEndpoint) -> Bool {
+        queue.sync { state.endpointRetryTokens[endpoint] != nil }
     }
 
     func stop() {
@@ -177,11 +297,36 @@ final class NetServiceTransport: NSObject, Transporter {
         }
     }
 
+    func stop(afterSending packages: [Serializable], deadline: TimeInterval) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard !packages.isEmpty, state.configuration?.hasValidAuthentication == true else {
+                state.epoch &+= 1
+                shutDown(clearPending: true)
+                return
+            }
+            state.isDraining = true
+            state.drainPending = state.boundedDrainPackages(packages)
+            browser?.cancel()
+            browser = nil
+            let token = UUID()
+            state.drainDeadlineToken = token
+            state.endpointRetryWindows.removeAll()
+            state.endpointRetryTokens.removeAll()
+            queue.asyncAfter(deadline: .now() + max(0, deadline)) { [weak self] in
+                guard let self, state.drainDeadlineToken == token else { return }
+                logger.info("Graceful transport drain reached its deadline")
+                finishDrain()
+            }
+            drainClosingPackages()
+        }
+    }
+
     func send(package: Serializable) {
         queue.async { [weak self] in
             guard let self, state.configuration?.hasValidAuthentication == true else { return }
             if readyConnections.isEmpty {
-                state.enqueue(package)
+                state.enqueue(package, now: Date().timeIntervalSince1970)
             } else {
                 broadcast(package)
             }
@@ -195,7 +340,6 @@ private extension NetServiceTransport {
     }
 
     func connectSimulator(epoch: UInt64) {
-        state.simulatorAttempts = 0
         attach(NWConnection(to: simulatorEndpoint(), using: .tcp), epoch: epoch)
     }
 
@@ -208,7 +352,9 @@ private extension NetServiceTransport {
         return .hostPort(host: host, port: port)
     }
 
-    func browseForDesktop() {
+    func browseForDesktop(epoch: UInt64? = nil) {
+        let expectedEpoch = epoch ?? state.epoch
+        guard expectedEpoch == state.epoch, browser == nil else { return }
         let parameters = NWParameters.tcp
         parameters.includePeerToPeer = true
         let candidate = NWBrowser(
@@ -217,18 +363,25 @@ private extension NetServiceTransport {
         )
         candidate.stateUpdateHandler = { [weak self, weak candidate] status in
             guard let self, let candidate else { return }
-            browserChanged(status, source: candidate)
+            browserChanged(status, source: candidate, epoch: expectedEpoch)
         }
-        candidate.browseResultsChangedHandler = { [weak self] _, changes in
-            self?.apply(changes)
+        candidate.browseResultsChangedHandler = { [weak self, weak candidate] _, changes in
+            guard let self,
+                  let candidate,
+                  browser === candidate,
+                  state.epoch == expectedEpoch else { return }
+            apply(changes)
         }
         browser = candidate
         candidate.start(queue: queue)
     }
 
-    func browserChanged(_ status: NWBrowser.State, source: NWBrowser) {
+    func browserChanged(_ status: NWBrowser.State, source: NWBrowser, epoch: UInt64) {
+        guard epoch == state.epoch, browser === source else { return }
         switch status {
         case .ready:
+            state.discoveryRetryWindow = BoundedRetryWindow(startedAt: Date().timeIntervalSince1970)
+            state.discoveryRetryToken = nil
             logger.info("Local service discovery is ready")
         case let .failed(error):
             logger.error("Local service discovery failed: \(Self.networkErrorCode(error), privacy: .public)")
@@ -236,6 +389,7 @@ private extension NetServiceTransport {
             if browser === source {
                 browser = nil
             }
+            scheduleDiscoveryRetry(epoch: epoch)
         case .cancelled:
             if browser === source {
                 browser = nil
@@ -261,10 +415,12 @@ private extension NetServiceTransport {
         for change in changes {
             switch change {
             case let .added(result):
+                state.discoveredEndpoints.insert(result.endpoint)
                 connectIfEligible(result.endpoint)
             case let .removed(result):
                 disconnect(result.endpoint)
             case let .changed(_, result, _):
+                state.discoveredEndpoints.insert(result.endpoint)
                 connectIfEligible(result.endpoint)
             default:
                 break
@@ -278,8 +434,12 @@ private extension NetServiceTransport {
     }
 
     func disconnect(_ endpoint: NWEndpoint) {
+        state.discoveredEndpoints.remove(endpoint)
+        state.endpointRetryWindows.removeValue(forKey: endpoint)
+        state.endpointRetryTokens.removeValue(forKey: endpoint)
         let matches = state.connections.filter { $0.endpoint == endpoint }
         for match in matches {
+            state.intentionallyCancelledConnections.insert(ObjectIdentifier(match))
             match.cancel()
             state.detach(match)
         }
@@ -315,6 +475,36 @@ private extension NetServiceTransport {
 }
 
 private extension NetServiceTransport {
+    func scheduleDiscoveryRetry(epoch: UInt64) {
+        guard epoch == state.epoch,
+              !state.isDraining,
+              var window = state.discoveryRetryWindow else { return }
+        let now = Date().timeIntervalSince1970
+        guard let delay = window.nextDelay(
+            now: now,
+            jitter: Double.random(in: 0.75 ... 1.25),
+            policy: discoveryRetryPolicy
+        ) else {
+            state.discoveryRetryWindow = nil
+            logger.error("Local service discovery retry limit reached")
+            return
+        }
+        state.discoveryRetryWindow = window
+        let token = UUID()
+        state.discoveryRetryToken = token
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  epoch == state.epoch,
+                  state.discoveryRetryToken == token,
+                  browser == nil,
+                  state.configuration?.hasValidAuthentication == true else { return }
+            state.discoveryRetryToken = nil
+            browseForDesktop(epoch: epoch)
+        }
+    }
+}
+
+private extension NetServiceTransport {
     func attach(_ connection: NWConnection, epoch: UInt64) {
         guard epoch == state.epoch else {
             connection.cancel()
@@ -337,7 +527,8 @@ private extension NetServiceTransport {
         case .setup, .preparing:
             break
         case .ready:
-            state.simulatorAttempts = 0
+            state.endpointRetryWindows.removeValue(forKey: connection.endpoint)
+            state.endpointRetryTokens.removeValue(forKey: connection.endpoint)
             sendIdentity(on: connection)
             flushPending()
             receive(on: connection, epoch: epoch)
@@ -345,33 +536,67 @@ private extension NetServiceTransport {
             handleWait(connection, error: error)
         case let .failed(error):
             logger.error("Connection failed: \(Self.networkErrorCode(error), privacy: .public)")
+            state.intentionallyCancelledConnections.remove(ObjectIdentifier(connection))
             state.detach(connection)
+            scheduleConnectionRetry(for: connection.endpoint, epoch: epoch)
         case .cancelled:
+            let identity = ObjectIdentifier(connection)
+            let wasIntentional = state.intentionallyCancelledConnections.remove(identity) != nil
+            let wasTracked = state.connections.contains { $0 === connection }
+            let shouldRetry = wasTracked && !wasIntentional && state.configuration?.hasValidAuthentication == true
             state.detach(connection)
+            if shouldRetry {
+                scheduleConnectionRetry(for: connection.endpoint, epoch: epoch)
+            }
         @unknown default:
             break
         }
     }
 
     func handleWait(_ connection: NWConnection, error: NWError) {
-        #if targetEnvironment(simulator)
+        logger.info("Connection is waiting: \(Self.networkErrorCode(error), privacy: .public)")
+        state.intentionallyCancelledConnections.insert(ObjectIdentifier(connection))
         connection.cancel()
         state.detach(connection)
-        guard state.simulatorAttempts < maximumSimulatorAttempts else {
-            logger.error("Simulator connection retry limit reached")
+        scheduleConnectionRetry(for: connection.endpoint, epoch: state.epoch)
+    }
+
+    func scheduleConnectionRetry(for endpoint: NWEndpoint, epoch: UInt64) {
+        guard epoch == state.epoch,
+              state.configuration?.hasValidAuthentication == true,
+              !state.isDraining || state.drainDeadlineToken != nil else { return }
+        #if !targetEnvironment(simulator)
+        guard state.discoveredEndpoints.contains(endpoint) else { return }
+        #endif
+        guard !state.connections.contains(where: { $0.endpoint == endpoint }) else { return }
+        var window = state.endpointRetryWindows[endpoint] ?? BoundedRetryWindow(startedAt: Date().timeIntervalSince1970)
+        let now = Date().timeIntervalSince1970
+        guard let delay = window.nextDelay(
+            now: now,
+            jitter: Double.random(in: 0.75 ... 1.25),
+            policy: reconnectPolicy
+        ) else {
+            state.endpointRetryWindows.removeValue(forKey: endpoint)
+            state.endpointRetryTokens.removeValue(forKey: endpoint)
+            logger.error("Connection retry limit reached")
             return
         }
-        state.simulatorAttempts += 1
-        let epoch = state.epoch
-        let attempt = state.simulatorAttempts
-        queue.asyncAfter(deadline: .now() + 15) { [weak self] in
-            guard let self, epoch == state.epoch else { return }
-            logger.info("Simulator connection retry \(attempt)")
-            attach(NWConnection(to: simulatorEndpoint(), using: .tcp), epoch: epoch)
+        state.endpointRetryWindows[endpoint] = window
+        let token = UUID()
+        state.endpointRetryTokens[endpoint] = token
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  epoch == state.epoch,
+                  state.endpointRetryTokens[endpoint] == token,
+                  state.configuration?.hasValidAuthentication == true,
+                  !state.connections.contains(where: { $0.endpoint == endpoint }) else { return }
+            #if !targetEnvironment(simulator)
+            guard state.discoveredEndpoints.contains(endpoint) else { return }
+            #endif
+            logger.info("Retrying the local connection")
+            state.endpointRetryTokens.removeValue(forKey: endpoint)
+            attach(NWConnection(to: endpoint, using: .tcp), epoch: epoch)
         }
-        #else
-        logger.info("Connection is waiting: \(Self.networkErrorCode(error), privacy: .public)")
-        #endif
     }
 
     static func networkErrorCode(_ error: NWError) -> String {
@@ -403,11 +628,11 @@ private extension NetServiceTransport {
             logger.error("Could not encode the connection identity")
             return
         }
-        retain(encoded)
+        _ = retain(encoded)
         transmit(encoded, on: connection)
     }
 
-    func broadcast(_ package: Serializable) {
+    func broadcast(_ package: Serializable, isClosingPackage: Bool = false) {
         guard let configuration = state.configuration,
               let encoded = WireProtocolCodec.frame(
                   package: package,
@@ -415,9 +640,16 @@ private extension NetServiceTransport {
                   sequence: state.nextSequence()
               ) else {
             logger.error("Could not encode an outgoing package")
+            finishDrainIfComplete()
             return
         }
-        retain(encoded)
+        guard retain(encoded) else {
+            finishDrainIfComplete()
+            return
+        }
+        if isClosingPackage {
+            state.drainingMessageIDs.insert(encoded.messageID)
+        }
         readyConnections.forEach { transmit(encoded, on: $0) }
     }
 
@@ -439,44 +671,52 @@ private extension NetServiceTransport {
     }
 
     func flushPending() {
-        guard !state.pending.isEmpty else { return }
-        let packages = state.pending
+        let now = Date().timeIntervalSince1970
+        let packages = state.pending.filter { now - $0.enqueuedAt < BabylonConstants.maximumPendingLifetime }
         state.pending.removeAll()
-        packages.forEach(broadcast)
+        state.pendingBytes = 0
+        packages.forEach { broadcast($0.package) }
+        drainClosingPackages()
     }
 
-    func retain(_ encoded: WireProtocolCodec.Frame) {
-        guard state.retained[encoded.messageID] == nil else { return }
+    @discardableResult
+    func retain(_ encoded: WireProtocolCodec.Frame) -> Bool {
+        guard state.retained[encoded.messageID] == nil else { return false }
         let byteCount = encoded.payload.count
-        guard byteCount <= BabylonConstants.maximumOutstandingBytes else { return }
+        guard byteCount <= BabylonConstants.maximumOutstandingBytes else { return false }
 
         while state.retainedOrder.count >= BabylonConstants.maxOutstandingFrames ||
             state.retainedBytes + byteCount > BabylonConstants.maximumOutstandingBytes {
             guard let oldest = state.retainedOrder.first else { break }
             state.removeRetained(oldest)
         }
-        state.retained[encoded.messageID] = RetainedFrame(encoded: encoded)
+        guard state.retainedBytes + byteCount <= BabylonConstants.maximumOutstandingBytes,
+              state.retainedOrder.count < BabylonConstants.maxOutstandingFrames else { return false }
+        state.retained[encoded.messageID] = RetainedFrame(encoded: encoded, createdAt: Date().timeIntervalSince1970)
         state.retainedOrder.append(encoded.messageID)
         state.retainedBytes += byteCount
         scheduleRetry(encoded.messageID, epoch: state.epoch)
+        return true
     }
 
     func scheduleRetry(_ messageID: String, epoch: UInt64) {
         queue.asyncAfter(deadline: .now() + acknowledgementDelay) { [weak self] in
             guard let self, epoch == state.epoch, var retained = state.retained[messageID] else { return }
-            let connections = readyConnections
-            if connections.isEmpty {
-                scheduleRetry(messageID, epoch: epoch)
+            if Date().timeIntervalSince1970 - retained.createdAt >= maximumAcknowledgementLifetime {
+                state.removeRetained(messageID)
+                finishDrainIfComplete()
+                logger.error("Outgoing message delivery expired before acknowledgement")
                 return
             }
             guard retained.retries < maximumAcknowledgementRetries else {
                 state.removeRetained(messageID)
+                finishDrainIfComplete()
                 logger.error("No acknowledgement for outgoing message \(messageID)")
                 return
             }
             retained.retries += 1
             state.retained[messageID] = retained
-            connections.forEach { self.transmit(retained.encoded, on: $0) }
+            readyConnections.forEach { self.transmit(retained.encoded, on: $0) }
             scheduleRetry(messageID, epoch: epoch)
         }
     }
@@ -533,7 +773,10 @@ private extension NetServiceTransport {
                     logger.error("Rejected a malformed acknowledgement")
                     return
                 }
-                state.removeRetained(acknowledgement.messageID)
+                if state.removeRetained(acknowledgement.messageID) {
+                    state.drainingMessageIDs.remove(acknowledgement.messageID)
+                    finishDrainIfComplete()
+                }
             case .error:
                 guard (try? JSONDecoder().decode(
                     BabylonProtocol.ProtocolError.self,
@@ -550,6 +793,32 @@ private extension NetServiceTransport {
         } catch {
             logger.error("Rejected an unauthenticated transport frame")
         }
+    }
+}
+
+private extension NetServiceTransport {
+    func drainClosingPackages() {
+        guard state.isDraining, !state.drainPending.isEmpty, !readyConnections.isEmpty else {
+            finishDrainIfComplete()
+            return
+        }
+        let packages = state.drainPending
+        state.drainPending.removeAll()
+        for package in packages {
+            broadcast(package, isClosingPackage: true)
+        }
+        finishDrainIfComplete()
+    }
+
+    func finishDrainIfComplete() {
+        guard state.isDraining, state.drainPending.isEmpty, state.drainingMessageIDs.isEmpty else { return }
+        finishDrain()
+    }
+
+    func finishDrain() {
+        guard state.isDraining || state.drainDeadlineToken != nil else { return }
+        state.epoch &+= 1
+        shutDown(clearPending: true)
     }
 }
 
