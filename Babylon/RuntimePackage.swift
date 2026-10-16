@@ -89,10 +89,16 @@ struct RuntimePackage: Codable, Serializable, CaptureMemoryEstimating {
     }
 
     var captureMemoryEstimate: Int {
-        let stringBytes = id.utf8.count + sessionId.utf8.count + (traceId?.utf8.count ?? 0) +
-            (stepId?.utf8.count ?? 0) + (parentStepId?.utf8.count ?? 0) + name.utf8.count +
-            metadata.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count } +
-            (error?.message.utf8.count ?? 0)
+        var stringBytes = id.utf8.count
+        stringBytes += sessionId.utf8.count
+        stringBytes += traceId?.utf8.count ?? 0
+        stringBytes += stepId?.utf8.count ?? 0
+        stringBytes += parentStepId?.utf8.count ?? 0
+        stringBytes += name.utf8.count
+        stringBytes += metadata.reduce(0) { partial, entry in
+            partial + entry.key.utf8.count + entry.value.utf8.count
+        }
+        stringBytes += error?.message.utf8.count ?? 0
         return CaptureMemoryEstimate.retained(bodyBytes: 0, stringBytes: stringBytes)
     }
 }

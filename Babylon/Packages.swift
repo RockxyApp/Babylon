@@ -182,12 +182,25 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
     }
 
     private var capturedStringSize: Int {
-        id.utf8.count + request.url.utf8.count + request.method.utf8.count +
-            request.headers.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count } +
-            (response?.headers.reduce(0) { $0 + $1.key.utf8.count + $1.value.utf8.count } ?? 0) +
-            (error?.message.utf8.count ?? 0) +
-            (correlationContext.map { $0.sessionId.utf8.count + $0.traceId.utf8.count + $0.stepId.utf8.count } ?? 0) +
-            (websocketMessagePackage?.captureMemoryStringSize ?? 0)
+        var byteCount = id.utf8.count
+        byteCount += request.url.utf8.count
+        byteCount += request.method.utf8.count
+        byteCount += request.headers.reduce(0) { partial, header in
+            partial + header.key.utf8.count + header.value.utf8.count
+        }
+        if let response {
+            byteCount += response.headers.reduce(0) { partial, header in
+                partial + header.key.utf8.count + header.value.utf8.count
+            }
+        }
+        byteCount += error?.message.utf8.count ?? 0
+        if let correlationContext {
+            byteCount += correlationContext.sessionId.utf8.count
+            byteCount += correlationContext.traceId.utf8.count
+            byteCount += correlationContext.stepId.utf8.count
+        }
+        byteCount += websocketMessagePackage?.captureMemoryStringSize ?? 0
+        return byteCount
     }
 
     public var debugDescription: String {
