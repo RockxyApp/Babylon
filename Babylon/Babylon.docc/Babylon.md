@@ -16,6 +16,19 @@ Babylon.start(authToken: debugPairingToken)
 
 Call ``Babylon/stop()`` when capture is no longer needed. Babylon does not activate runtime hooks in non-debug builds.
 
+For asynchronous work, scope requests to their trace so overlapping workflows keep their own context:
+
+```swift
+let checkout = Babylon.startTrace("Checkout")
+await checkout.withStep("Load Cart") {
+    await loadCart()
+}
+```
+
+Structured child tasks inherit the scope. For detached tasks and callbacks, capture ``BabylonTrace/correlationContext``
+and pass it with ``Babylon/withTraceContext(_:operation:)``. Existing unscoped calls continue to infer context while
+exactly one trace is active; when multiple traces overlap, Babylon leaves the context unset instead of guessing.
+
 ## Topics
 
 ### Lifecycle
@@ -35,6 +48,11 @@ Call ``Babylon/stop()`` when capture is no longer needed. Babylon does not activ
 ### Runtime timeline
 
 - ``Babylon/startTrace(_:metadata:)``
+- ``Babylon/withTrace(_:operation:)``
+- ``Babylon/withTraceContext(_:operation:)``
+- ``Babylon/currentCorrelationContext``
+- ``BabylonTrace/correlationContext``
+- ``BabylonTrace/withStep(_:metadata:operation:)``
 - ``Babylon/mark(_:metadata:)``
 - ``Babylon/event(_:metadata:)``
 - ``Babylon/error(_:error:metadata:)``

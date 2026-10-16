@@ -47,7 +47,13 @@ jobs:
           fi
 
       - name: Validate shared protocol fixture corpus
-        run: python3 rockxy/docs/tools/validate_babylon_fixtures.py "$GITHUB_WORKSPACE"
+        run: |
+          validator=rockxy/docs/tools/validate_babylon_fixtures.py
+          if [ -f "$validator" ]; then
+            python3 "$validator" "$GITHUB_WORKSPACE"
+          else
+            echo "::notice::The selected Rockxy ref has no shared-fixture validator; Babylon fixture decode tests still run below."
+          fi
 
       - name: Install formatting tools
         run: brew install swiftformat swiftlint

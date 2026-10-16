@@ -339,7 +339,7 @@ extension Babylon {
     }
 
     func ensureCorrelation(for id: String) {
-        if traceContextStore.correlationContext(forPackageId: id) == nil {
+        if !traceContextStore.hasCapturedCorrelationContext(forPackageId: id) {
             traceContextStore.setCorrelationContext(traceContextStore.activeCorrelationContext(), forPackageId: id)
         }
     }
@@ -348,20 +348,24 @@ extension Babylon {
 extension Babylon {
     func scheduleManualCapture(_ operation: @escaping (CorrelationContext?) -> Void) {
         guard Babylon.isEnabled.value else { return }
-        let generation = queue.sync { ledger.generation }
+        let scope = BabylonTraceScope.current
+        let (generation, context) = queue.sync {
+            (ledger.generation, traceContextStore.activeCorrelationContext(scope: scope))
+        }
         queue.async { [weak self] in
             guard let self,
                   Babylon.isEnabled.value,
                   generation == ledger.generation else { return }
-            operation(traceContextStore.activeCorrelationContext())
+            operation(context)
         }
     }
 }
 
 extension Babylon: InjectorDelegate {
     func injectorSessionWillCreateTask(request: URLRequest) -> CorrelatedURLRequest {
-        queue.sync {
-            let context = Babylon.isEnabled.value ? traceContextStore.activeCorrelationContext() : nil
+        let scope = BabylonTraceScope.current
+        return queue.sync {
+            let context = Babylon.isEnabled.value ? traceContextStore.activeCorrelationContext(scope: scope) : nil
             return CorrelatedURLRequest(request: request, correlationContext: context)
         }
     }

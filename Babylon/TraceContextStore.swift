@@ -35,8 +35,8 @@ final class TraceContextStore {
     private var sessionId: String?
     private var sessionStartedAt: TimeInterval?
     private var traces: [String: TraceRecord] = [:]
-    private var activeTraceId: String?
     private var packageCorrelationContexts: [String: CorrelationContext] = [:]
+    private var capturedPackageIDs: Set<String> = []
 
     var currentSessionId: String? {
         sessionId
@@ -49,8 +49,8 @@ final class TraceContextStore {
         sessionId = newSessionId
         sessionStartedAt = now
         traces.removeAll()
-        activeTraceId = nil
         packageCorrelationContexts.removeAll()
+        capturedPackageIDs.removeAll()
 
         return RuntimePackage(
             kind: .sessionStarted,
@@ -90,8 +90,8 @@ final class TraceContextStore {
         sessionId = nil
         sessionStartedAt = nil
         traces.removeAll()
-        activeTraceId = nil
         packageCorrelationContexts.removeAll()
+        capturedPackageIDs.removeAll()
     }
 
     func startTrace(name: String, metadata: [String: String]) -> TraceStartResult {
@@ -111,8 +111,6 @@ final class TraceContextStore {
             activeStepName: name,
             activeStepStartedAt: now
         )
-        activeTraceId = traceId
-
         let package = RuntimePackage(
             kind: .traceStarted,
             sessionId: sessionId,
@@ -144,8 +142,6 @@ final class TraceContextStore {
         trace.activeStepName = name
         trace.activeStepStartedAt = now
         traces[traceId] = trace
-        activeTraceId = traceId
-
         let finished = RuntimePackage(
             kind: .stepFinished,
             sessionId: sessionId,
@@ -179,26 +175,32 @@ final class TraceContextStore {
         return finishTrace(traceId: traceId, metadata: metadata, endedAt: Date().timeIntervalSince1970)
     }
 
-    func mark(name: String, metadata: [String: String]) -> RuntimePackage? {
-        buildInstantPackage(kind: .mark, name: name, metadata: metadata, error: nil)
+    func mark(name: String, metadata: [String: String], scope: CorrelationScope?) -> RuntimePackage? {
+        buildInstantPackage(kind: .mark, name: name, metadata: metadata, error: nil, scope: scope)
     }
 
-    func event(name: String, metadata: [String: String]) -> RuntimePackage? {
-        buildInstantPackage(kind: .event, name: name, metadata: metadata, error: nil)
+    func event(name: String, metadata: [String: String], scope: CorrelationScope?) -> RuntimePackage? {
+        buildInstantPackage(kind: .event, name: name, metadata: metadata, error: nil, scope: scope)
     }
 
-    func error(name: String, error: Error, metadata: [String: String]) -> RuntimePackage? {
-        buildInstantPackage(kind: .error, name: name, metadata: metadata, error: CustomError(error))
+    func error(
+        name: String,
+        error: Error,
+        metadata: [String: String],
+        scope: CorrelationScope?
+    ) -> RuntimePackage? {
+        buildInstantPackage(kind: .error, name: name, metadata: metadata, error: CustomError(error), scope: scope)
     }
 
-    func activeCorrelationContext() -> CorrelationContext? {
-        guard let sessionId,
-              let traceId = activeTraceId,
-              let trace = traces[traceId],
-              !trace.isFinished else {
-            return nil
+    func activeCorrelationContext(scope: CorrelationScope? = nil) -> CorrelationContext? {
+        guard let sessionId else { return nil }
+        if let scope {
+            guard let context = scope.context, context.sessionId == sessionId else { return nil }
+            return context
         }
 
+        let activeTraces = traces.values.filter { !$0.isFinished }
+        guard activeTraces.count == 1, let trace = activeTraces.first else { return nil }
         return CorrelationContext(
             sessionId: sessionId,
             traceId: trace.traceId,
@@ -206,8 +208,13 @@ final class TraceContextStore {
         )
     }
 
+    func correlationContext(forTraceId traceId: String) -> CorrelationContext? {
+        guard let sessionId, let trace = traces[traceId], !trace.isFinished else { return nil }
+        return CorrelationContext(sessionId: sessionId, traceId: trace.traceId, stepId: trace.activeStepId)
+    }
+
     func setCorrelationContext(_ context: CorrelationContext?, forPackageId packageId: String) {
-        guard let context else { return }
+        capturedPackageIDs.insert(packageId)
         packageCorrelationContexts[packageId] = context
     }
 
@@ -217,6 +224,11 @@ final class TraceContextStore {
 
     func removeCorrelationContext(forPackageId packageId: String) {
         packageCorrelationContexts.removeValue(forKey: packageId)
+        capturedPackageIDs.remove(packageId)
+    }
+
+    func hasCapturedCorrelationContext(forPackageId packageId: String) -> Bool {
+        capturedPackageIDs.contains(packageId)
     }
 
     private func finishTrace(
@@ -232,13 +244,6 @@ final class TraceContextStore {
 
         trace.finishedAt = endedAt
         traces[traceId] = trace
-        if activeTraceId == traceId {
-            activeTraceId = traces.values
-                .filter { !$0.isFinished }
-                .max { $0.activeStepStartedAt < $1.activeStepStartedAt }?
-                .traceId
-        }
-
         let stepFinished = RuntimePackage(
             kind: .stepFinished,
             sessionId: sessionId,
@@ -270,17 +275,18 @@ final class TraceContextStore {
         kind: RuntimePackage.Kind,
         name: String,
         metadata: [String: String],
-        error: CustomError?
+        error: CustomError?,
+        scope: CorrelationScope?
     ) -> RuntimePackage? {
         guard let sessionId else { return nil }
         let now = Date().timeIntervalSince1970
-        let trace = activeTraceId.flatMap { traces[$0] }
+        let correlation = activeCorrelationContext(scope: scope)
 
         return RuntimePackage(
             kind: kind,
             sessionId: sessionId,
-            traceId: trace?.traceId,
-            stepId: trace?.activeStepId,
+            traceId: correlation?.traceId,
+            stepId: correlation?.stepId,
             name: name,
             createdAt: now,
             metadata: metadata,
