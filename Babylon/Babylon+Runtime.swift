@@ -11,6 +11,13 @@ public final class BabylonTrace: Sendable {
         self.traceId = traceId
     }
 
+    /// A snapshot of this trace's current session and step, suitable for explicit propagation.
+    /// The value remains stable when the trace advances to another step.
+    public var correlationContext: CorrelationContext? {
+        guard let traceId, Babylon.isEnabled.value else { return nil }
+        return Babylon.shared.correlationContextSnapshot(forTraceId: traceId)
+    }
+
     /// Finishes the current step and starts a new step within this trace.
     ///
     /// Calls after ``finish(metadata:)`` are no-ops.
@@ -30,9 +37,96 @@ public final class BabylonTrace: Sendable {
     public func finish(metadata: [String: String] = [:]) {
         Babylon.shared.finishTrace(traceId: traceId, metadata: metadata)
     }
+
+    /// Starts a step and runs asynchronous work with that step's scoped correlation context.
+    public func withStep<T>(
+        _ name: String,
+        metadata: [String: String] = [:],
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        step(name, metadata: metadata)
+        return try await Babylon.withTrace(self, operation: operation)
+    }
+
+    /// Starts a step and runs synchronous callback work with that step's scoped context.
+    public func withStep<T>(
+        _ name: String,
+        metadata: [String: String] = [:],
+        operation: () throws -> T
+    ) rethrows -> T {
+        step(name, metadata: metadata)
+        return try Babylon.withTrace(self, operation: operation)
+    }
 }
 
 public extension Babylon {
+    /// The scoped correlation context for the current task, or the legacy context when exactly
+    /// one trace is active. Returns `nil` when concurrent traces make inference ambiguous.
+    class var currentCorrelationContext: CorrelationContext? {
+        Babylon.shared.activeCorrelationContextSnapshot(scope: BabylonTraceScope.current)
+    }
+
+    #if compiler(>=6.2)
+    /// Runs asynchronous work with a trace context. Structured child tasks inherit the scope.
+    class func withTrace<T>(
+        _ trace: BabylonTrace,
+        operation: nonisolated(nonsending) () async throws -> T
+    ) async rethrows -> T {
+        try await BabylonTraceScope.$current.withValue(
+            CorrelationScope(context: trace.correlationContext),
+            operation: operation
+        )
+    }
+    #else
+    /// Runs asynchronous work with a trace context. Structured child tasks inherit the scope.
+    class func withTrace<T>(
+        _ trace: BabylonTrace,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await BabylonTraceScope.$current.withValue(
+            CorrelationScope(context: trace.correlationContext),
+            operation: operation
+        )
+    }
+    #endif
+
+    /// Runs synchronous callback work with a trace context.
+    class func withTrace<T>(
+        _ trace: BabylonTrace,
+        operation: () throws -> T
+    ) rethrows -> T {
+        try BabylonTraceScope.$current.withValue(
+            CorrelationScope(context: trace.correlationContext),
+            operation: operation
+        )
+    }
+
+    #if compiler(>=6.2)
+    /// Runs asynchronous work with an explicitly captured context, including detached tasks.
+    class func withTraceContext<T>(
+        _ context: CorrelationContext,
+        operation: nonisolated(nonsending) () async throws -> T
+    ) async rethrows -> T {
+        try await BabylonTraceScope.$current.withValue(CorrelationScope(context: context), operation: operation)
+    }
+    #else
+    /// Runs asynchronous work with an explicitly captured context, including detached tasks.
+    class func withTraceContext<T>(
+        _ context: CorrelationContext,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await BabylonTraceScope.$current.withValue(CorrelationScope(context: context), operation: operation)
+    }
+    #endif
+
+    /// Runs callback or queue work with an explicitly captured context.
+    class func withTraceContext<T>(
+        _ context: CorrelationContext,
+        operation: () throws -> T
+    ) rethrows -> T {
+        try BabylonTraceScope.$current.withValue(CorrelationScope(context: context), operation: operation)
+    }
+
     /// Starts a workflow trace that can correlate application execution with network traffic.
     ///
     /// - Parameters:
@@ -86,19 +180,24 @@ public extension Babylon {
     class func error(_ name: String, error: Error, metadata: [String: String] = [:]) {
         guard isEnabled.value else { return }
 
+        let scope = BabylonTraceScope.current
         var package: RuntimePackage?
         Babylon.shared.queue.sync {
-            package = Babylon.shared.traceContextStore.error(name: name, error: error, metadata: metadata)
+            package = Babylon.shared.traceContextStore.error(name: name, error: error, metadata: metadata, scope: scope)
         }
         Babylon.shared.startSendingRuntimeMessages(packages: package.map { [$0] } ?? [])
     }
 }
 
 extension Babylon {
-    func activeCorrelationContextSnapshot() -> CorrelationContext? {
+    func activeCorrelationContextSnapshot(scope: CorrelationScope?) -> CorrelationContext? {
         queue.sync {
-            traceContextStore.activeCorrelationContext()
+            traceContextStore.activeCorrelationContext(scope: scope)
         }
+    }
+
+    func correlationContextSnapshot(forTraceId traceId: String) -> CorrelationContext? {
+        queue.sync { traceContextStore.correlationContext(forTraceId: traceId) }
     }
 
     func stepTrace(traceId: String?, name: String, metadata: [String: String]) {
@@ -124,13 +223,14 @@ extension Babylon {
     func sendInstantRuntime(kind: RuntimePackage.Kind, name: String, metadata: [String: String]) {
         guard Babylon.isEnabled.value else { return }
 
+        let scope = BabylonTraceScope.current
         var package: RuntimePackage?
         queue.sync {
             switch kind {
             case .mark:
-                package = traceContextStore.mark(name: name, metadata: metadata)
+                package = traceContextStore.mark(name: name, metadata: metadata, scope: scope)
             case .event:
-                package = traceContextStore.event(name: name, metadata: metadata)
+                package = traceContextStore.event(name: name, metadata: metadata, scope: scope)
             case .error,
                  .sessionStarted,
                  .sessionFinished,

@@ -87,7 +87,7 @@ struct BabylonRuntimeTests {
         defer { stopRuntimeCapture() }
 
         let trace = Babylon.startTrace("Checkout")
-        let originalContext = try #require(Babylon.shared.activeCorrelationContextSnapshot())
+        let originalContext = try #require(trace.correlationContext)
         let url = try #require(URL(string: "https://example.com/cart"))
         let task = URLSession.shared.dataTask(with: URLRequest(url: url))
         Babylon.shared.injectorSessionDidCreateTask(task: task, correlationContext: originalContext)
@@ -109,20 +109,181 @@ struct BabylonRuntimeTests {
         task.cancel()
     }
 
-    @Test("Most recently stepped unfinished trace becomes active context")
-    func lastSteppedTraceWins() throws {
+    @Test("Legacy inference is available only when one trace is active")
+    func legacyInferenceRequiresUnambiguousTrace() throws {
         _ = startRuntimeCapture()
         defer { stopRuntimeCapture() }
 
         let first = Babylon.startTrace("First")
+        let firstContext = try #require(Babylon.currentCorrelationContext)
         let second = Babylon.startTrace("Second")
         first.step("First Step")
-        let contextAfterFirstStep = try #require(Babylon.shared.activeCorrelationContextSnapshot())
+        #expect(Babylon.currentCorrelationContext == nil)
 
-        second.step("Second Step")
-        let contextAfterSecondStep = try #require(Babylon.shared.activeCorrelationContextSnapshot())
+        second.finish()
+        let contextAfterSecondFinishes = try #require(Babylon.currentCorrelationContext)
+        #expect(contextAfterSecondFinishes.traceId == first.correlationContext?.traceId)
+        #expect(firstContext.traceId == first.correlationContext?.traceId)
+    }
 
-        #expect(contextAfterFirstStep.traceId != contextAfterSecondStep.traceId)
+    @Test("Scoped contexts isolate interleaved traces and inherit into child tasks")
+    func scopedConcurrentTraceContexts() async throws {
+        _ = startRuntimeCapture()
+        defer { stopRuntimeCapture() }
+
+        let first = Babylon.startTrace("Checkout")
+        let second = Babylon.startTrace("Background Sync")
+        let firstID = try #require(first.correlationContext?.traceId)
+        let secondID = try #require(second.correlationContext?.traceId)
+
+        let results = await withTaskGroup(of: String?.self) { group in
+            group.addTask {
+                await Babylon.withTrace(first) {
+                    await Task.yield()
+                    return await withTaskGroup(of: String?.self) { childTasks in
+                        childTasks.addTask { Babylon.currentCorrelationContext?.traceId }
+                        return await childTasks.next() ?? nil
+                    }
+                }
+            }
+            group.addTask {
+                await Babylon.withTrace(second) {
+                    await Task.yield()
+                    return await withTaskGroup(of: String?.self) { childTasks in
+                        childTasks.addTask { Babylon.currentCorrelationContext?.traceId }
+                        return await childTasks.next() ?? nil
+                    }
+                }
+            }
+
+            var values: Set<String> = []
+            for await traceID in group {
+                if let traceID {
+                    values.insert(traceID)
+                }
+            }
+            return values
+        }
+
+        #expect(results == [firstID, secondID])
+        #expect(Babylon.currentCorrelationContext == nil)
+    }
+
+    @Test("Explicit context propagates to detached and callback work")
+    func explicitContextPropagation() async throws {
+        _ = startRuntimeCapture()
+        defer { stopRuntimeCapture() }
+
+        let trace = Babylon.startTrace("Checkout")
+        _ = Babylon.startTrace("Background Sync")
+        let context = try #require(trace.correlationContext)
+        let detachedContext = await Task.detached {
+            Babylon.withTraceContext(context) {
+                Babylon.currentCorrelationContext
+            }
+        }.value
+        let callbackQueue = DispatchQueue(label: "BabylonRuntimeTests.explicit-context")
+        let callbackContext = callbackQueue.sync {
+            Babylon.withTraceContext(context) {
+                Babylon.currentCorrelationContext
+            }
+        }
+
+        #expect(detachedContext == context)
+        #expect(callbackContext == context)
+        #expect(Babylon.currentCorrelationContext == nil)
+    }
+
+    @Test("Task creation snapshots scoped context without mutating requests")
+    func scopedTaskCreationSnapshotDoesNotMutateRequest() throws {
+        _ = startRuntimeCapture()
+        defer { stopRuntimeCapture() }
+
+        let first = Babylon.startTrace("Checkout")
+        _ = Babylon.startTrace("Background Sync")
+        let url = try #require(URL(string: "https://example.com/cart"))
+        var request = URLRequest(url: url)
+        request.setValue("caller-value", forHTTPHeaderField: "X-Correlation")
+
+        let correlated = Babylon.withTrace(first) {
+            Babylon.shared.injectorSessionWillCreateTask(request: request)
+        }
+
+        #expect(correlated.correlationContext?.traceId == first.correlationContext?.traceId)
+        #expect(correlated.request == request)
+        #expect(correlated.request.value(forHTTPHeaderField: "X-Correlation") == "caller-value")
+    }
+
+    @Test("Ambiguous nil context stays unset when a URLSession task resumes later")
+    func ambiguousTaskSnapshotDoesNotAcquireLaterTrace() throws {
+        let transport = startRuntimeCapture()
+        defer { stopRuntimeCapture() }
+
+        let first = Babylon.startTrace("Checkout")
+        let second = Babylon.startTrace("Background Sync")
+        let url = try #require(URL(string: "https://example.com/cart"))
+        let task = URLSession.shared.dataTask(with: URLRequest(url: url))
+        let creation = Babylon.shared.injectorSessionWillCreateTask(request: URLRequest(url: url))
+        #expect(creation.correlationContext == nil)
+        Babylon.shared.injectorSessionDidCreateTask(task: task, correlationContext: creation.correlationContext)
+
+        second.finish()
+        let response = try #require(HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: [:]
+        ))
+        Babylon.shared.injectorSessionDidCallResume(task: task)
+        Babylon.shared.injectorSessionDidReceiveResponse(dataTask: task, response: response)
+        Babylon.shared.injectorSessionDidComplete(task: task, error: nil)
+
+        let traffic = try waitForTrafficPackage(from: transport)
+        #expect(traffic?.correlationContext == nil)
+        #expect(Babylon.currentCorrelationContext?.traceId == first.correlationContext?.traceId)
+        task.cancel()
+    }
+
+    @Test("Old explicit contexts do not cross a stop and restart boundary")
+    func contextDoesNotCrossSessionRestart() throws {
+        _ = startRuntimeCapture()
+        defer { stopRuntimeCapture() }
+
+        let oldTrace = Babylon.startTrace("Old Session")
+        let oldContext = try #require(oldTrace.correlationContext)
+
+        Babylon.stop()
+        let transport = MockTransporter()
+        Babylon.setTransporterForTesting(transport)
+        Babylon.start()
+        let newTrace = Babylon.startTrace("New Session")
+
+        let resolved = Babylon.withTraceContext(oldContext) {
+            Babylon.currentCorrelationContext
+        }
+        #expect(resolved == nil)
+        #expect(Babylon.currentCorrelationContext?.sessionId != oldContext.sessionId)
+        newTrace.finish()
+    }
+
+    @Test("Cancelled scoped work does not leak context to its parent")
+    func cancelledScopeDoesNotLeak() async {
+        _ = startRuntimeCapture()
+        defer { stopRuntimeCapture() }
+
+        let trace = Babylon.startTrace("Checkout")
+        _ = Babylon.startTrace("Background Sync")
+        let task = Task {
+            await Babylon.withTrace(trace) {
+                try? await Task.sleep(for: .seconds(30))
+                return Babylon.currentCorrelationContext
+            }
+        }
+        task.cancel()
+        let taskContext = await task.value
+
+        #expect(taskContext?.traceId == trace.correlationContext?.traceId)
+        #expect(Babylon.currentCorrelationContext == nil)
     }
 
     @Test("Concurrent runtime calls do not crash")

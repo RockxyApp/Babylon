@@ -30,6 +30,14 @@ public struct CorrelationContext: Codable, Equatable, Sendable {
     }
 }
 
+struct CorrelationScope: Sendable {
+    let context: CorrelationContext?
+}
+
+enum BabylonTraceScope {
+    @TaskLocal static var current: CorrelationScope?
+}
+
 struct CorrelatedURLRequest {
     let request: URLRequest
     let correlationContext: CorrelationContext?
