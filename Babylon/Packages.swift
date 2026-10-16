@@ -341,6 +341,13 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
         if let context {
             invalidateBasePayload()
             correlationContext = context
+            guard resizeCaptureLease(toBodyBytes: capturedBodySize, estimatedBytes: captureMemoryEstimate) else {
+                correlationContext = nil
+                if let captureMemoryLease {
+                    _ = captureMemoryLease.resize(to: captureMemoryEstimate)
+                }
+                return
+            }
         }
     }
 

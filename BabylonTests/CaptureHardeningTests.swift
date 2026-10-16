@@ -341,6 +341,26 @@ struct CaptureHardeningTests {
         #expect(budget.snapshot.usedBytes == retainedBytes)
     }
 
+    @Test("Correlation metadata is omitted when it exceeds the remaining capture budget")
+    func correlationMetadataRespectsRemainingCaptureBudget() {
+        let budget = CaptureMemoryBudget(limit: 9000)
+        let package = TrafficPackage(
+            id: "bounded-correlation",
+            request: Request(url: "https://example.com", method: "GET", headers: [], body: nil)
+        )
+        #expect(package.admitCapture(using: budget))
+        let retainedBytes = budget.snapshot.usedBytes
+
+        package.setCorrelationContext(CorrelationContext(
+            sessionId: String(repeating: "s", count: 512),
+            traceId: String(repeating: "t", count: 512),
+            stepId: String(repeating: "p", count: 512)
+        ))
+
+        #expect(package.correlationContext == nil)
+        #expect(budget.snapshot.usedBytes == retainedBytes)
+    }
+
     #if os(macOS)
     private func residentPeakBytes() -> Int {
         var usage = rusage()
