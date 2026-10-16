@@ -121,6 +121,7 @@ final class CapturingBabylonDelegate: BabylonDelegate {
 final class MockTransporter: Transporter {
     private let queue = DispatchQueue(label: "com.amunx.babylon.tests.mocktransporter")
     private var _sentPackages: [Serializable] = []
+    private let stopped = DispatchSemaphore(value: 0)
     private(set) var startCallCount = 0
     private(set) var stopCallCount = 0
     private(set) var lastConfig: Configuration?
@@ -140,11 +141,16 @@ final class MockTransporter: Transporter {
         queue.sync {
             stopCallCount += 1
         }
+        stopped.signal()
     }
 
     func send(package: Serializable) {
         queue.sync {
             _sentPackages.append(package)
         }
+    }
+
+    func waitForStopCall(timeout: TimeInterval) -> Bool {
+        stopped.wait(timeout: .now() + timeout) == .success
     }
 }

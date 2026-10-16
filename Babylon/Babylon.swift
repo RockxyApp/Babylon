@@ -181,20 +181,25 @@ public final class Babylon: NSObject {
     public class func stop() {
         guard isEnabled.compareExchange(expected: true, desired: false) else { return }
         let instance = Babylon.shared
-        let closingMessages = instance.queue.sync {
-            instance.traceContextStore.finishSession(
-                name: instance.configuration.projectName,
-                metadata: [:]
-            )
-        }
-        instance.startSendingRuntimeMessages(packages: closingMessages)
+        let transport = instance.transporter
         _ = instance.activeClientID.exchange("")
         instance.invalidateEncodingWork()
-        instance.transporter.stop()
         instance.queue.async {
+            let configuration = instance.configuration
+            let closingPackages = instance.traceContextStore.finishSession(
+                name: configuration.projectName,
+                metadata: [:]
+            )
+            let closingMessages = instance.transportEnabled.value
+                ? closingPackages.compactMap { Message.buildRuntimeMessage(id: configuration.id, item: $0) }
+                : []
             instance.configuration = .default()
             instance.ledger.clear()
             instance.traceContextStore.clear()
+            transport.stop(
+                afterSending: closingMessages,
+                deadline: BabylonConstants.gracefulTransportDrainDeadline
+            )
         }
     }
 

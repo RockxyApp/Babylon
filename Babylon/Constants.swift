@@ -32,6 +32,15 @@ enum BabylonConstants {
     /// Maximum number of unsent packages held in the pending queue.
     static let maxPendingItems = 50
 
+    /// Maximum estimated bytes held by unsent network deliveries.
+    static let maximumPendingBytes = 75_497_472
+
+    /// Maximum time an unsent package remains eligible for delivery.
+    static let maximumPendingLifetime: TimeInterval = 60
+
+    /// Grace period for acknowledging final runtime packages after Babylon.stop().
+    static let gracefulTransportDrainDeadline: TimeInterval = 8
+
     /// Maximum accepted encrypted protocol frame before any payload allocation.
     static let maximumFrameSize = 75_497_472
 

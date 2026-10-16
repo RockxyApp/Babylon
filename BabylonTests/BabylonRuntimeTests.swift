@@ -58,6 +58,44 @@ struct BabylonRuntimeTests {
         #expect(transport.sentPackages.isEmpty)
     }
 
+    @Test("Stop is non-blocking and delivers closing trace and session packages")
+    func stopDrainsClosingRuntimePackagesWithoutBlocking() {
+        let transport = startRuntimeCapture()
+        defer { stopRuntimeCapture() }
+
+        let trace = Babylon.startTrace("Active at stop")
+        trace.step("Final step")
+
+        let queueEntered = DispatchSemaphore(value: 0)
+        let releaseQueue = DispatchSemaphore(value: 0)
+        Babylon.shared.queue.async {
+            queueEntered.signal()
+            _ = releaseQueue.wait(timeout: .now() + 5)
+        }
+        #expect(queueEntered.wait(timeout: .now() + 2) == .success)
+
+        let startedAt = Date()
+        Babylon.stop()
+        let stopDuration = Date().timeIntervalSince(startedAt)
+        releaseQueue.signal()
+
+        #expect(stopDuration < 0.5)
+        #expect(transport.waitForStopCall(timeout: 2))
+        let packages = decodedRuntimePackages(from: transport)
+        let kinds = packages.map(\.kind)
+        let stepFinishedIndex = kinds.firstIndex(of: .stepFinished)
+        let traceFinishedIndex = kinds.firstIndex(of: .traceFinished)
+        let sessionFinishedIndex = kinds.firstIndex(of: .sessionFinished)
+
+        #expect(stepFinishedIndex != nil)
+        #expect(traceFinishedIndex != nil)
+        #expect(sessionFinishedIndex != nil)
+        if let stepFinishedIndex, let traceFinishedIndex, let sessionFinishedIndex {
+            #expect(stepFinishedIndex < traceFinishedIndex)
+            #expect(traceFinishedIndex < sessionFinishedIndex)
+        }
+    }
+
     @Test("Manual HTTP package includes active correlation context")
     func manualTrafficIncludesCorrelationContext() throws {
         let transport = startRuntimeCapture()
