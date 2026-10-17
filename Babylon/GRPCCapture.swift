@@ -185,8 +185,13 @@ public struct GRPCCapture: Codable, Sendable {
     }
 
     var captureMemoryStringSize: Int {
-        endpoint.utf8.count + (authority?.utf8.count ?? 0) + service.utf8.count + method.utf8.count +
-            (statusMessage?.utf8.count ?? 0) + messages.count * 64
+        let endpointBytes = endpoint.utf8.count
+        let authorityBytes = authority?.utf8.count ?? 0
+        let serviceBytes = service.utf8.count
+        let methodBytes = method.utf8.count
+        let statusMessageBytes = statusMessage?.utf8.count ?? 0
+        let messageOverheadBytes = messages.count * 64
+        return endpointBytes + authorityBytes + serviceBytes + methodBytes + statusMessageBytes + messageOverheadBytes
     }
 
     var captureMemoryEstimate: Int {
