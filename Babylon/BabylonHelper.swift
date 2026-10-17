@@ -22,6 +22,7 @@ final class BabylonHelper: NSObject {
     @objc
     static func swizzleWebSocketReceiveMessage(
         withCompleteHandler handler: AnyObject,
+        receiveCompletionHandler: ((Error?) -> Void)?,
         responseHandler: ((String?, Data?, Error?) -> Void)?
     ) -> AnyObject? {
         typealias Completion = @convention(block) (NSObject?, NSError?) -> Void
@@ -32,10 +33,13 @@ final class BabylonHelper: NSObject {
 
         let original = unsafeBitCast(handler, to: Completion.self)
         let intercepted: Completion = { message, error in
+            receiveCompletionHandler?(error)
+            original(message, error)
             if let message, NSStringFromClass(type(of: message)) == "NSURLSessionWebSocketMessage" {
                 responseHandler?(extractString(from: message), extractData(from: message), error)
+            } else if let error {
+                responseHandler?(nil, nil, error)
             }
-            original(message, error)
         }
         return intercepted as AnyObject
     }

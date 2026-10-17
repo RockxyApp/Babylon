@@ -41,4 +41,21 @@ enum BabylonTraceScope {
 struct CorrelatedURLRequest {
     let request: URLRequest
     let correlationContext: CorrelationContext?
+    let capturePolicyDecision: CapturePolicyDecision
+
+    init(
+        request: URLRequest,
+        correlationContext: CorrelationContext?,
+        capturePolicyDecision: CapturePolicyDecision = .included
+    ) {
+        self.request = request
+        self.correlationContext = correlationContext
+        self.capturePolicyDecision = capturePolicyDecision
+    }
+}
+
+struct PreparedTaskInput {
+    let object: AnyObject
+    let correlationContext: CorrelationContext?
+    let capturePolicyDecision: CapturePolicyDecision
 }

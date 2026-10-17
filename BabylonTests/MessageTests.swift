@@ -113,6 +113,22 @@ struct MessageTests {
         #expect(String(data: contentData, encoding: .utf8)?.contains(testPairingToken) == false)
     }
 
+    @Test("Connection package advertises bounded producer capabilities")
+    func connectionPackageAdvertisesCapabilities() throws {
+        let package = ConnectionPackage(config: .default(authToken: testPairingToken))
+        let data = try #require(package.toData())
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let capabilities = try #require(json["capabilities"] as? [String: Any])
+        let schemas = capabilities["payloadSchemaVersions"] as? [String: Int]
+        #expect(capabilities["sdkVersion"] as? String == BabylonConstants.buildVersion)
+        #expect(capabilities["platform"] as? String == "macOS")
+        #expect(capabilities["maximumBodyBytes"] as? Int == BabylonConstants.maximumBodySize)
+        #expect(capabilities["maximumWebSocketFrameBytes"] as? Int == BabylonConstants.maximumWebSocketFrameSize)
+        #expect(capabilities["maximumCaptureMemoryBytes"] as? Int == BabylonConstants.maximumCaptureMemoryBytes)
+        #expect(schemas?["grpcCapture"] == 1)
+        #expect(String(data: data, encoding: .utf8)?.contains(testPairingToken) == false)
+    }
+
     // MARK: - Error Handling
 
     @Test("Builder returns nil when item encoding fails")

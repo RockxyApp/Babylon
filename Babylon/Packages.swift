@@ -122,6 +122,7 @@ struct ConnectionPackage: Codable, Serializable, CaptureMemoryEstimating {
     let device: Device
     let project: Project
     let icon: Data?
+    let capabilities: ProducerCapabilities
 
     init(config: Configuration) {
         let detectedDevice = Device.current
@@ -129,6 +130,7 @@ struct ConnectionPackage: Codable, Serializable, CaptureMemoryEstimating {
         device = Device(name: config.deviceName, model: detectedDevice.model)
         project = Project(name: config.projectName, bundleIdentifier: detectedProject.bundleIdentifier)
         icon = PackageEncoding.bounded(Image.appIcon?.getPNGData(), limit: BabylonConstants.maximumCaptureIconBytes)
+        capabilities = ProducerCapabilities.current
     }
 
     func toData() -> Data? {
@@ -137,7 +139,7 @@ struct ConnectionPackage: Codable, Serializable, CaptureMemoryEstimating {
 
     var captureMemoryEstimate: Int {
         let stringBytes = device.name.utf8.count + device.model.utf8.count + project.name.utf8.count +
-            project.bundleIdentifier.utf8.count
+            project.bundleIdentifier.utf8.count + capabilities.captureMemoryEstimate
         return CaptureMemoryEstimate.retained(bodyBytes: icon?.count ?? 0, stringBytes: stringBytes)
     }
 }
@@ -146,6 +148,7 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
     public enum PackageType: String, Codable {
         case http
         case websocket
+        case grpc
     }
 
     public let id: String
@@ -158,18 +161,28 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
     public private(set) var lastData: Data?
     public let packageType: PackageType
     public private(set) var correlationContext: CorrelationContext?
+    private(set) var urlSessionTiming: URLSessionTiming?
     private(set) var websocketMessagePackage: WebsocketMessagePackage?
+    private(set) var grpcCapture: GRPCCapture?
     // The runtime lease is excluded from CodingKeys; decoding must restore an unleased package.
     // swiftlint:disable:next implicit_optional_initialization
     private var captureMemoryLease: CaptureMemoryLease? = nil
     private var basePayloadCache = TrafficPackageBasePayloadCache()
+    private var maximumRequestBodyBytes = BabylonConstants.maximumBodySize
+    private var maximumResponseBodyBytes = BabylonConstants.maximumBodySize
+    private var metadataOnlyCapture = false
+    private var capturePolicy = CapturePolicy()
+    private var captureRequest: URLRequest?
+    public private(set) var requestBodyOmission: CaptureOmission?
+    public private(set) var responseBodyOmission: CaptureOmission?
     var basePayloadEncodingCount: Int {
         basePayloadCache.encodingCount
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, startAt, request, response, error, responseBodyData, endAt, lastData
-        case packageType, correlationContext, websocketMessagePackage
+        case packageType, correlationContext, urlSessionTiming, websocketMessagePackage, grpcCapture
+        case requestBodyOmission, responseBodyOmission
     }
 
     var captureMemoryEstimate: Int {
@@ -178,7 +191,7 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
 
     private var capturedBodySize: Int {
         PackageEncoding.capturedSize(request.body) + PackageEncoding.capturedSize(responseBodyData) +
-            (websocketMessagePackage?.capturedBodySize ?? 0)
+            (websocketMessagePackage?.capturedBodySize ?? 0) + (grpcCapture?.capturedBodySize ?? 0)
     }
 
     private var capturedStringSize: Int {
@@ -199,7 +212,9 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
             byteCount += correlationContext.traceId.utf8.count
             byteCount += correlationContext.stepId.utf8.count
         }
+        byteCount += urlSessionTiming?.retainedByteCount ?? 0
         byteCount += websocketMessagePackage?.captureMemoryStringSize ?? 0
+        byteCount += grpcCapture?.captureMemoryStringSize ?? 0
         return byteCount
     }
 
@@ -225,13 +240,31 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
         self.endAt = endAt
         self.correlationContext = correlationContext
         let responseLimit = BabylonConstants.maximumBodySize - PackageEncoding.capturedSize(request.body)
-        self.responseBodyData = PackageEncoding.bounded(responseBodyData ?? Data(), limit: responseLimit) ?? Data()
+        self.responseBodyData = PackageEncoding.bounded(
+            responseBodyData ?? Data(),
+            limit: min(responseLimit, maximumResponseBodyBytes)
+        ) ?? Data()
     }
 
-    static func buildRequest(sessionTask: URLSessionTask, id: String) -> TrafficPackage? {
-        guard let request = Request(sessionTask.currentRequestSafe) else { return nil }
-        if request.body == nil, let body = sessionTask.originalRequestBodySafe, !body.isEmpty {
-            request.appendBody(body)
+    static func buildRequest(
+        sessionTask: URLSessionTask,
+        id: String,
+        maximumRequestBodyBytes: Int = BabylonConstants.maximumBodySize,
+        metadataOnly: Bool = false
+    ) -> TrafficPackage? {
+        guard let sourceRequest = sessionTask.currentRequestSafe,
+              let request = Request(
+                  sourceRequest,
+                  maximumBodyBytes: maximumRequestBodyBytes,
+                  metadataOnly: metadataOnly
+              ) else {
+            return nil
+        }
+        if !metadataOnly, request.body == nil, let body = sessionTask.originalRequestBodySafe, !body.isEmpty {
+            request.appendBody(
+                body,
+                maximumBodySize: min(max(0, maximumRequestBodyBytes), BabylonConstants.maximumBodySize)
+            )
         }
         let type: PackageType = if let webSocketTaskClass = NSClassFromString("__NSURLSessionWebSocketTask"),
                                    sessionTask.isKind(of: webSocketTaskClass) {
@@ -266,6 +299,12 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
     func updateResponse(_ response: URLResponse) {
         invalidateBasePayload()
         self.response = Response(response)
+        if let captureRequest,
+           !capturePolicy.responseDecision(for: response, request: captureRequest).included {
+            let observed = PackageEncoding.capturedSize(responseBodyData)
+            responseBodyOmission = CaptureOmission(reason: .rule, observedBytes: observed)
+            responseBodyData = Data()
+        }
         guard resizeCaptureLease(toBodyBytes: capturedBodySize, estimatedBytes: captureMemoryEstimate) else {
             self.response = nil
             if let captureMemoryLease {
@@ -279,6 +318,20 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
         invalidateBasePayload()
         endAt = Date().timeIntervalSince1970
         self.error = error.map(CustomError.init)
+        if let omission = requestBodyOmission {
+            requestBodyOmission = CaptureOmission(
+                reason: omission.reason,
+                observedBytes: omission.observedBytes,
+                originalBytes: omission.observedBytes
+            )
+        }
+        if let omission = responseBodyOmission {
+            responseBodyOmission = CaptureOmission(
+                reason: omission.reason,
+                observedBytes: omission.observedBytes,
+                originalBytes: omission.observedBytes
+            )
+        }
         guard resizeCaptureLease(toBodyBytes: capturedBodySize, estimatedBytes: captureMemoryEstimate) else {
             self.error = nil
             if let captureMemoryLease {
@@ -290,8 +343,35 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
 
     func appendRequestData(_ data: Data) {
         invalidateBasePayload()
+        if let omission = requestBodyOmission {
+            requestBodyOmission = CaptureOmission(
+                reason: CapturePolicyDecision.OmissionReason(rawValue: omission.reason) ?? .bodyLimit,
+                observedBytes: min(omission.observedBytes + data.count, BabylonConstants.maximumBodySize * 1024)
+            )
+            request.resetBody()
+            return
+        }
+        guard !metadataOnlyCapture else {
+            recordRequestOmission(observedBytes: min(
+                (request.body?.count ?? 0) + data.count,
+                BabylonConstants.maximumBodySize * 1024
+            ))
+            request.resetBody()
+            return
+        }
+        guard data.count <= max(0, maximumRequestBodyBytes - (request.body?.count ?? 0)) else {
+            recordRequestOmission(observedBytes: min(
+                (request.body?.count ?? 0) + data.count,
+                BabylonConstants.maximumBodySize * 1024
+            ))
+            request.resetBody()
+            return
+        }
         guard resizeCaptureLease(forAdditionalBodyBytes: data.count, omittingRequestOnFailure: true) else { return }
-        request.appendBody(data, maximumBodySize: remainingBodyCapacity(excluding: .request))
+        request.appendBody(
+            data,
+            maximumBodySize: min(maximumRequestBodyBytes, remainingBodyCapacity(excluding: .request))
+        )
         if let captureMemoryLease {
             _ = captureMemoryLease.resize(to: captureMemoryEstimate)
         }
@@ -303,7 +383,47 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
     }
 
     func appendResponseData(_ data: Data) {
+        if let omission = responseBodyOmission,
+           omission.reason == CapturePolicyDecision.OmissionReason.bodyLimit.rawValue {
+            invalidateBasePayload()
+            responseBodyOmission = CaptureOmission(
+                reason: .bodyLimit,
+                observedBytes: min(omission.observedBytes + data.count, BabylonConstants.maximumBodySize * 1024),
+                originalBytes: omission.originalBytes
+            )
+            return
+        }
+        if let omission = responseBodyOmission,
+           omission.reason == CapturePolicyDecision.OmissionReason.rule.rawValue {
+            invalidateBasePayload()
+            responseBodyOmission = CaptureOmission(
+                reason: .rule,
+                observedBytes: min(omission.observedBytes + data.count, BabylonConstants.maximumBodySize * 1024),
+                originalBytes: omission.originalBytes
+            )
+            return
+        }
         guard responseBodyData != PackageEncoding.omittedBody else { return }
+        guard !metadataOnlyCapture else {
+            recordResponseOmission(observedBytes: min(
+                PackageEncoding.capturedSize(responseBodyData) + data.count,
+                BabylonConstants.maximumBodySize * 1024
+            ))
+            invalidateBasePayload()
+            responseBodyData = Data()
+            lastData = nil
+            return
+        }
+        guard data.count <= max(0, maximumResponseBodyBytes - PackageEncoding.capturedSize(responseBodyData)) else {
+            recordResponseOmission(observedBytes: min(
+                PackageEncoding.capturedSize(responseBodyData) + data.count,
+                BabylonConstants.maximumBodySize * 1024
+            ))
+            invalidateBasePayload()
+            responseBodyData = PackageEncoding.omittedBody
+            lastData = nil
+            return
+        }
         guard resizeCaptureLease(forAdditionalBodyBytes: data.count, omittingRequestOnFailure: false) else {
             invalidateBasePayload()
             responseBodyData = PackageEncoding.omittedBody
@@ -351,6 +471,19 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
         }
     }
 
+    func setURLSessionTiming(_ timing: URLSessionTiming) {
+        invalidateBasePayload()
+        let previous = urlSessionTiming
+        urlSessionTiming = timing
+        guard resizeCaptureLease(toBodyBytes: capturedBodySize, estimatedBytes: captureMemoryEstimate) else {
+            urlSessionTiming = previous
+            if let captureMemoryLease {
+                _ = captureMemoryLease.resize(to: captureMemoryEstimate)
+            }
+            return
+        }
+    }
+
     func toData() -> Data? {
         lastData = nil
         if responseBodyData.count > BabylonConstants.maximumBodySize {
@@ -373,22 +506,72 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
                 endAt: endAt,
                 lastData: lastData,
                 packageType: packageType,
-                correlationContext: correlationContext
+                correlationContext: correlationContext,
+                urlSessionTiming: urlSessionTiming,
+                requestBodyOmission: requestBodyOmission,
+                responseBodyOmission: responseBodyOmission
             )
             return PackageEncoding.encode(base, label: "traffic package base")
         }) else { return nil }
-        guard let websocketMessagePackage else { return cachedBasePayload }
-        guard let encodedFrame = PackageEncoding.encode(websocketMessagePackage, label: "WebSocket package") else {
-            return nil
-        }
         var result = cachedBasePayload
-        if result.last == UInt8(ascii: "}"), result.count > 2 {
+        if let websocketMessagePackage,
+           let encodedFrame = PackageEncoding.encode(websocketMessagePackage, label: "WebSocket package"),
+           result.last == UInt8(ascii: "}"), result.count > 2 {
             result.removeLast()
             result.append(contentsOf: ",\"websocketMessagePackage\":".utf8)
             result.append(encodedFrame)
             result.append(UInt8(ascii: "}"))
         }
+        if let grpcCapture,
+           let encodedGRPC = PackageEncoding.encode(grpcCapture, label: "gRPC capture"),
+           result.last == UInt8(ascii: "}"), result.count > 2 {
+            result.removeLast()
+            result.append(contentsOf: ",\"grpcCapture\":".utf8)
+            result.append(encodedGRPC)
+            result.append(UInt8(ascii: "}"))
+        }
         return result
+    }
+
+    func configureCaptureLimits(
+        requestBytes: Int,
+        responseBytes: Int,
+        metadataOnly: Bool,
+        policy: CapturePolicy,
+        request: URLRequest,
+        observedRequestBodyBytes: Int? = nil
+    ) {
+        maximumRequestBodyBytes = min(max(0, requestBytes), BabylonConstants.maximumBodySize)
+        maximumResponseBodyBytes = min(max(0, responseBytes), BabylonConstants.maximumBodySize)
+        metadataOnlyCapture = metadataOnly
+        capturePolicy = policy
+        captureRequest = request
+        let requestSize = PackageEncoding.capturedSize(self.request.body)
+        if let observedRequestBodyBytes,
+           metadataOnly || observedRequestBodyBytes > maximumRequestBodyBytes {
+            recordRequestOmission(observedBytes: min(observedRequestBodyBytes, BabylonConstants.maximumBodySize * 1024))
+            self.request.resetBody()
+        }
+        if metadataOnly || requestSize > maximumRequestBodyBytes {
+            if observedRequestBodyBytes == nil {
+                recordRequestOmission(observedBytes: min(requestSize, BabylonConstants.maximumBodySize * 1024))
+            }
+            self.request.resetBody()
+        }
+        let responseSize = PackageEncoding.capturedSize(responseBodyData)
+        if metadataOnly || responseSize > maximumResponseBodyBytes {
+            recordResponseOmission(observedBytes: min(responseSize, BabylonConstants.maximumBodySize * 1024))
+            responseBodyData = Data()
+        }
+        invalidateBasePayload()
+    }
+
+    private func recordRequestOmission(observedBytes: Int) {
+        requestBodyOmission = CaptureOmission(reason: .bodyLimit, observedBytes: observedBytes)
+    }
+
+    private func recordResponseOmission(observedBytes: Int) {
+        responseBodyOmission = CaptureOmission(reason: .bodyLimit, observedBytes: observedBytes)
     }
 
     func makeSnapshot() -> TrafficPackage? {
@@ -405,6 +588,10 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
         )
         copy.error = error
         copy.websocketMessagePackage = websocketMessagePackage
+        copy.grpcCapture = grpcCapture
+        copy.urlSessionTiming = urlSessionTiming
+        copy.requestBodyOmission = requestBodyOmission
+        copy.responseBodyOmission = responseBodyOmission
         copy.captureMemoryLease = lease
         copy.basePayloadCache = basePayloadCache
         return copy
@@ -470,7 +657,24 @@ public final class TrafficPackage: Codable, CustomDebugStringConvertible, Serial
         if section != .webSocket {
             used += websocketMessagePackage?.capturedBodySize ?? 0
         }
+        used += grpcCapture?.capturedBodySize ?? 0
         return max(0, BabylonConstants.maximumBodySize - used)
+    }
+
+    func setGRPCCapture(_ capture: GRPCCapture) {
+        let bounded = capture.bounded(maximumBodySize: remainingBodyCapacity(excluding: .webSocket))
+        let previous = grpcCapture?.capturedBodySize ?? 0
+        let target = capturedBodySize - previous + bounded.capturedBodySize
+        guard resizeCaptureLease(toBodyBytes: target) else {
+            grpcCapture = capture.bounded(maximumBodySize: 0)
+            if let captureMemoryLease {
+                _ = captureMemoryLease.resize(to: captureMemoryEstimate)
+            }
+            invalidateBasePayload()
+            return
+        }
+        grpcCapture = bounded
+        invalidateBasePayload()
     }
 }
 
@@ -485,6 +689,63 @@ private struct TrafficPackageBase: Encodable {
     let lastData: Data?
     let packageType: TrafficPackage.PackageType
     let correlationContext: CorrelationContext?
+    let urlSessionTiming: URLSessionTiming?
+    let requestBodyOmission: CaptureOmission?
+    let responseBodyOmission: CaptureOmission?
+}
+
+struct ProducerCapabilities: Codable, CaptureMemoryEstimating {
+    let sdkVersion: String
+    let platform: String
+    let payloadSchemaVersions: [String: Int]
+    let supportedMessageTypes: [String]
+    let supportedTrafficTypes: [String]
+    let maximumBodyBytes: Int
+    let maximumWebSocketFrameBytes: Int
+    let maximumCaptureMemoryBytes: Int
+
+    static var current: ProducerCapabilities {
+        ProducerCapabilities(
+            sdkVersion: BabylonConstants.buildVersion,
+            platform: platformName,
+            payloadSchemaVersions: [
+                "connection": 1,
+                "traffic": 1,
+                "grpcCapture": 1,
+                "runtime": 1,
+                "urlSessionTiming": URLSessionTiming.currentSchemaVersion
+            ],
+            supportedMessageTypes: ["connection", "traffic", "runtime", "ack", "rejection"],
+            supportedTrafficTypes: ["http", "websocket", "grpc"],
+            maximumBodyBytes: BabylonConstants.maximumBodySize,
+            maximumWebSocketFrameBytes: BabylonConstants.maximumWebSocketFrameSize,
+            maximumCaptureMemoryBytes: BabylonConstants.maximumCaptureMemoryBytes
+        )
+    }
+
+    var captureMemoryEstimate: Int {
+        let stringBytes = sdkVersion.utf8.count + platform.utf8.count +
+            payloadSchemaVersions.keys.reduce(0) { $0 + $1.utf8.count } +
+            supportedMessageTypes.reduce(0) { $0 + $1.utf8.count } +
+            supportedTrafficTypes.reduce(0) { $0 + $1.utf8.count }
+        return CaptureMemoryEstimate.retained(bodyBytes: 0, stringBytes: stringBytes)
+    }
+
+    private static var platformName: String {
+        #if os(macOS)
+        "macOS"
+        #elseif os(iOS)
+        "iOS"
+        #elseif os(tvOS)
+        "tvOS"
+        #elseif os(watchOS)
+        "watchOS"
+        #elseif os(visionOS)
+        "visionOS"
+        #else
+        "unknown"
+        #endif
+    }
 }
 
 private final class TrafficPackageBasePayloadCache {
@@ -573,7 +834,7 @@ struct Project: Codable {
     }
 }
 
-public struct Header: Codable {
+public struct Header: Codable, Sendable {
     public let key: String
     public let value: String
 
@@ -596,7 +857,11 @@ public final class Request: Codable {
         self.body = PackageEncoding.bounded(body, limit: BabylonConstants.maximumBodySize)
     }
 
-    init?(_ source: URLRequest?) {
+    init?(
+        _ source: URLRequest?,
+        maximumBodyBytes: Int = BabylonConstants.maximumBodySize,
+        metadataOnly: Bool = false
+    ) {
         guard let source else { return nil }
         let sourceURL = CaptureString.bounded(source.url?.absoluteString ?? "-")
         url = CaptureString.bounded(CaptureRedaction.url(sourceURL))
@@ -606,9 +871,9 @@ public final class Request: Codable {
                 .headers(CaptureString.headers((source.allHTTPHeaderFields ?? [:]).map { name, value in
                     Header(key: name, value: value)
                 })))
-        body = source.httpBodyStream == nil
-            ? PackageEncoding.bounded(source.httpBody, limit: BabylonConstants.maximumBodySize)
-            : nil
+        let sourceBody = metadataOnly || source.httpBodyStream != nil ? nil : source.httpBody
+        let policyLimit = min(max(0, maximumBodyBytes), BabylonConstants.maximumBodySize)
+        body = PackageEncoding.bounded(sourceBody, limit: policyLimit)
     }
 
     func appendBody(_ data: Data, maximumBodySize: Int = BabylonConstants.maximumBodySize) {
@@ -670,9 +935,13 @@ public struct CustomError: Codable {
 public struct WebsocketMessagePackage: Codable, Serializable, CaptureMemoryEstimating {
     public enum MessageType: String, Codable {
         case pingPong
+        case ping
+        case pong
         case send
         case receive
         case sendCloseMessage
+        case receiveCloseMessage
+        case abnormalTermination
     }
 
     public enum Message {
@@ -693,6 +962,10 @@ public struct WebsocketMessagePackage: Codable, Serializable, CaptureMemoryEstim
     private let messageType: MessageType
     private let stringValue: String?
     private let dataValue: Data?
+    private let closeCode: Int?
+    private let closeReason: String?
+    private let closeOrigin: String?
+    private let abnormal: Bool?
 
     var capturedBodySize: Int {
         if messageType == .sendCloseMessage {
@@ -708,11 +981,11 @@ public struct WebsocketMessagePackage: Codable, Serializable, CaptureMemoryEstim
     }
 
     var captureMemoryStringSize: Int {
-        id.utf8.count + (stringValue?.utf8.count ?? 0)
+        id.utf8.count + (stringValue?.utf8.count ?? 0) + (closeReason?.utf8.count ?? 0)
     }
 
     var captureMemoryEstimate: Int {
-        let strings = id.utf8.count + (stringValue?.utf8.count ?? 0)
+        let strings = captureMemoryStringSize + (closeOrigin?.utf8.count ?? 0)
         return CaptureMemoryEstimate.retained(bodyBytes: capturedBodySize, stringBytes: strings)
     }
 
@@ -720,12 +993,18 @@ public struct WebsocketMessagePackage: Codable, Serializable, CaptureMemoryEstim
         self.id = CaptureString.bounded(id, maximumBytes: 512)
         createdAt = Date().timeIntervalSince1970
         self.messageType = messageType
+        closeCode = nil
+        closeReason = nil
+        closeOrigin = nil
+        abnormal = nil
         switch message {
         case let .data(value):
-            dataValue = PackageEncoding.bounded(value, limit: BabylonConstants.maximumBodySize)
+            dataValue = PackageEncoding.bounded(value, limit: BabylonConstants.maximumWebSocketFrameSize)
             stringValue = nil
         case let .string(value):
-            stringValue = value.utf8.count <= BabylonConstants.maximumBodySize ? value : PackageEncoding.omittedText
+            stringValue = value.utf8.count <= BabylonConstants.maximumWebSocketFrameSize
+                ? value
+                : PackageEncoding.omittedText
             dataValue = nil
         }
     }
@@ -735,17 +1014,38 @@ public struct WebsocketMessagePackage: Codable, Serializable, CaptureMemoryEstim
         createdAt = Date().timeIntervalSince1970
         messageType = .sendCloseMessage
         stringValue = String(closeCode)
-        dataValue = PackageEncoding.bounded(reason, limit: BabylonConstants.maximumBodySize)
+        dataValue = PackageEncoding.bounded(reason, limit: BabylonConstants.maximumWebSocketFrameSize)
+        self.closeCode = closeCode
+        closeReason = reason.map { String(decoding: $0.prefix(123), as: UTF8.self) }
+        closeOrigin = "local"
+        abnormal = nil
+    }
+
+    init(id: String, closeCode: Int?, reason: Data?, origin: String, abnormal: Bool) {
+        self.id = CaptureString.bounded(id, maximumBytes: 512)
+        createdAt = Date().timeIntervalSince1970
+        messageType = abnormal ? .abnormalTermination : .receiveCloseMessage
+        stringValue = closeCode.map(String.init)
+        dataValue = PackageEncoding.bounded(reason, limit: BabylonConstants.maximumWebSocketFrameSize)
+        self.closeCode = closeCode
+        closeReason = reason.map { String(decoding: $0.prefix(123), as: UTF8.self) }
+        closeOrigin = origin
+        self.abnormal = abnormal
     }
 
     func bounded(maximumBodySize: Int) -> WebsocketMessagePackage {
-        guard capturedBodySize <= maximumBodySize else {
+        let limit = min(maximumBodySize, BabylonConstants.maximumWebSocketFrameSize)
+        guard capturedBodySize <= limit else {
             return WebsocketMessagePackage(
                 id: id,
                 createdAt: createdAt,
                 messageType: messageType,
                 stringValue: dataValue == nil ? PackageEncoding.omittedText : stringValue,
-                dataValue: dataValue == nil ? nil : PackageEncoding.omittedBody
+                dataValue: dataValue == nil ? nil : PackageEncoding.omittedBody,
+                closeCode: closeCode,
+                closeReason: closeReason,
+                closeOrigin: closeOrigin,
+                abnormal: abnormal
             )
         }
         return self
@@ -760,13 +1060,21 @@ public struct WebsocketMessagePackage: Codable, Serializable, CaptureMemoryEstim
         createdAt: TimeInterval,
         messageType: MessageType,
         stringValue: String?,
-        dataValue: Data?
+        dataValue: Data?,
+        closeCode: Int? = nil,
+        closeReason: String? = nil,
+        closeOrigin: String? = nil,
+        abnormal: Bool? = nil
     ) {
         self.id = id
         self.createdAt = createdAt
         self.messageType = messageType
         self.stringValue = stringValue
         self.dataValue = dataValue
+        self.closeCode = closeCode
+        self.closeReason = closeReason
+        self.closeOrigin = closeOrigin
+        self.abnormal = abnormal
     }
 }
 
