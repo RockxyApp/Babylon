@@ -265,6 +265,10 @@ struct RockxyProtocolFixtureTests {
             TrafficPackage.self,
             from: Data(contentsOf: directory.appendingPathComponent("grpc.json"))
         )
+        let timing = try decoder.decode(
+            TrafficPackage.self,
+            from: Data(contentsOf: directory.appendingPathComponent("url-session-timing.json"))
+        )
         let runtime = try decoder.decode(
             RuntimePackage.self,
             from: Data(contentsOf: directory.appendingPathComponent("runtime.json"))
@@ -277,10 +281,20 @@ struct RockxyProtocolFixtureTests {
         #expect(success.correlationContext?.traceId == "trace-success")
         #expect(failure.error?.code == -1001)
         #expect(websocket.packageType == .websocket)
-        #expect(grpc.request.method == "GRPC")
+        #expect(grpc.request.method == "POST")
+        #expect(grpc.packageType == .grpc)
         #expect(grpc.request.url == "/example.Greeter/SayHello")
         #expect(grpc.request.body == Data([0x08, 0x01]))
         #expect(grpc.responseBodyData == Data([0x08, 0x02]))
+        #expect(grpc.grpcCapture?.schemaVersion == 1)
+        #expect(grpc.grpcCapture?.callType == .unary)
+        #expect(grpc.grpcCapture?.trailers.first(where: { $0.key == "grpc-status" })?.value == "0")
+        #expect(timing.urlSessionTiming?.schemaVersion == URLSessionTiming.currentSchemaVersion)
+        #expect(timing.urlSessionTiming?.redirectCount == 1)
+        #expect(timing.urlSessionTiming?.transactions.map(\.index) == [0, 1])
+        #expect(timing.urlSessionTiming?.transactions.last?.reusedConnection == true)
+        #expect(timing.urlSessionTiming?.transactions.first?.secureConnectDuration == nil)
+        #expect(connection.capabilities.payloadSchemaVersions["urlSessionTiming"] == 1)
         #expect(runtime.id == "runtime-event-1")
         let acknowledgement = try decoder.decode(
             BabylonProtocol.Ack.self,
