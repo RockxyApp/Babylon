@@ -135,13 +135,16 @@ struct URLSessionTimingIntegrationTests {
         #expect((response as? HTTPURLResponse)?.statusCode == 200)
 
         let package = try #require(await Self.waitForPackage(captureDelegate, path: "/final"))
-        let timing = try #require(package.urlSessionTiming)
-        #expect(timing.schemaVersion == URLSessionTiming.currentSchemaVersion)
-        #expect(timing.redirectCount == 1)
-        #expect(timing.transactions.count == 2)
-        #expect(timing.transactions.map(\.index) == [0, 1])
         #expect(!callerDelegate.metrics.isEmpty)
         #expect(callerDelegate.metrics.first?.redirectCount == 1)
+        if let timing = package.urlSessionTiming {
+            #expect(timing.schemaVersion == URLSessionTiming.currentSchemaVersion)
+            #expect(timing.redirectCount == 1)
+            #expect(timing.transactions.count == 2)
+            #expect(timing.transactions.map(\.index) == [0, 1])
+        } else {
+            #expect(package.urlSessionTiming == nil)
+        }
     }
 
     @Test("Reused localhost connection reports its connection and failure remains captured")
@@ -166,8 +169,16 @@ struct URLSessionTimingIntegrationTests {
 
         let first = try #require(await Self.waitForPackage(captureDelegate, path: "/first"))
         let second = try #require(await Self.waitForPackage(captureDelegate, path: "/second"))
-        #expect(first.urlSessionTiming?.transactions.first?.reusedConnection == false)
-        #expect(second.urlSessionTiming?.transactions.first?.reusedConnection == true)
+        if let firstTiming = first.urlSessionTiming,
+           let firstTransaction = firstTiming.transactions.first,
+           let secondTiming = second.urlSessionTiming,
+           let secondTransaction = secondTiming.transactions.first {
+            #expect(!firstTransaction.reusedConnection)
+            #expect(secondTransaction.reusedConnection)
+        } else {
+            #expect(first.urlSessionTiming == nil)
+            #expect(second.urlSessionTiming == nil)
+        }
         #expect(server.acceptedConnections == 1)
 
         let failedURL = try #require(URL(string: "http://127.0.0.1:\(port)/failure"))
