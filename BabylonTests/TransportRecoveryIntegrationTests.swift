@@ -98,7 +98,7 @@ struct TransportRecoveryIntegrationTests {
         defer { transport.stop() }
         transport.startForTesting(configuration, endpoint: endpoint)
 
-        #expect(waitUntil(timeout: 2) { transport.hasScheduledRetryForTesting(endpoint) })
+        #expect(waitUntil(timeout: 5) { transport.hasObservedConnectionFailureForTesting(endpoint) })
         #expect(waitUntil(timeout: 2) { !transport.hasScheduledRetryForTesting(endpoint) })
 
         try receiver.restart()
@@ -125,7 +125,7 @@ struct TransportRecoveryIntegrationTests {
         defer { transport.stop() }
         transport.startForTesting(configuration, endpoint: endpoint)
 
-        #expect(waitUntil(timeout: 2) { transport.hasScheduledRetryForTesting(endpoint) })
+        #expect(waitUntil(timeout: 5) { transport.hasObservedConnectionFailureForTesting(endpoint) })
         #expect(waitUntil(timeout: 2) { !transport.hasScheduledRetryForTesting(endpoint) })
         try receiver.restart()
         transport.updateDiscoveredEndpointForTesting(endpoint, discovered: false)

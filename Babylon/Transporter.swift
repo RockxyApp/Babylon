@@ -297,6 +297,10 @@ final class NetServiceTransport: NSObject, Transporter {
         queue.sync { state.endpointRetryTokens[endpoint] != nil }
     }
 
+    func hasObservedConnectionFailureForTesting(_ endpoint: NWEndpoint) -> Bool {
+        queue.sync { state.endpointsWithConnectionFailures.contains(endpoint) }
+    }
+
     func hasUndeliveredDrainPackagesForTesting() -> Bool {
         queue.sync { state.drainHadUndeliveredPackages }
     }
