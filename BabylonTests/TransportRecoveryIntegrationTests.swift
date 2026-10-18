@@ -42,8 +42,17 @@ struct TransportRecoveryIntegrationTests {
         transport.send(package: runtimeMessage(configuration: configuration, name: "queued-during-restart"))
 
         try receiver.restart()
-        #expect(receiver.waitForRuntimeFrameCount(1, timeout: 8))
-        #expect(receiver.runtimeMessageIDs.count == 1)
+        #expect(receiver.waitForRuntimeFrameCount(3, timeout: 8))
+        #expect(receiver.runtimeEventStates.contains("reconnecting"))
+        #expect(receiver.runtimeEventStates.contains("reconnected"))
+        #expect(receiver.runtimeEventNames.contains("queued-during-restart"))
+        let retryMetadata = try #require(receiver.runtimeEventMetadata.first { $0["transportState"] == "reconnecting" })
+        #expect(retryMetadata["retryAttempt"] == "1")
+        #expect(retryMetadata["retryDelayMilliseconds"] != nil)
+        if let networkError = retryMetadata["networkError"] {
+            #expect(["posix:", "dns:", "tls:", "other"].contains { networkError.hasPrefix($0) })
+        }
+        #expect(receiver.runtimeMessageIDs.count == 3)
     }
 
     @Test("Endpoint removal cancels retries until rediscovery")
@@ -97,6 +106,35 @@ struct TransportRecoveryIntegrationTests {
         #expect(receiver.runtimeMessageIDs.isEmpty)
     }
 
+    @Test("Retry exhaustion state is delivered after the endpoint returns")
+    func retryExhaustionStateFlushesAfterRediscovery() throws {
+        let configuration = testConfiguration()
+        let receiver = try LoopbackTransportReceiver(configuration: configuration)
+        defer { receiver.stop() }
+        let endpoint = receiver.endpoint
+        receiver.stop()
+
+        let transport = NetServiceTransport(
+            reconnectPolicy: BoundedRetryPolicy(
+                maximumAttempts: 1,
+                maximumLifetime: 1,
+                initialDelay: 0.05,
+                maximumDelay: 0.05
+            )
+        )
+        defer { transport.stop() }
+        transport.startForTesting(configuration, endpoint: endpoint)
+
+        #expect(waitUntil(timeout: 2) { transport.hasScheduledRetryForTesting(endpoint) })
+        #expect(waitUntil(timeout: 2) { !transport.hasScheduledRetryForTesting(endpoint) })
+        try receiver.restart()
+        transport.updateDiscoveredEndpointForTesting(endpoint, discovered: false)
+        transport.updateDiscoveredEndpointForTesting(endpoint, discovered: true)
+
+        #expect(receiver.waitForRuntimeFrameCount(1, timeout: 3))
+        #expect(receiver.runtimeEventStates.suffix(2) == ["reconnecting", "retryExhausted"])
+    }
+
     @Test("Graceful shutdown waits for acknowledgements of closing runtime messages")
     func gracefulShutdownDeliversClosingMessages() throws {
         let configuration = testConfiguration()
@@ -110,8 +148,11 @@ struct TransportRecoveryIntegrationTests {
         let closingMessage = runtimeMessage(configuration: configuration, name: "trace-finished")
         transport.stop(afterSending: [closingMessage], deadline: 3)
 
-        #expect(receiver.waitForRuntimeFrameCount(1, timeout: 3))
-        #expect(receiver.runtimeMessageIDs.count == 1)
+        #expect(receiver.waitForRuntimeFrameCount(3, timeout: 3))
+        #expect(receiver.runtimeEventStates.contains("draining"))
+        #expect(receiver.runtimeEventStates.contains("drainCompleted"))
+        #expect(receiver.runtimeEventNames.contains("trace-finished"))
+        #expect(receiver.runtimeMessageIDs.count == 3)
     }
 
     private func testConfiguration() -> Configuration {
@@ -158,6 +199,9 @@ private final class LoopbackTransportReceiver {
     private var listener: NWListener?
     private var connections: [NWConnection] = []
     private var receivedRuntimeIDs: [String] = []
+    private var receivedRuntimeNames: [String] = []
+    private var receivedTransportStates: [String] = []
+    private var receivedTransportMetadata: [[String: String]] = []
     private var acceptedConnectionCount = 0
     private var shouldDropFirstRuntimeAck: Bool
     private var didDropRuntimeAck = false
@@ -175,6 +219,24 @@ private final class LoopbackTransportReceiver {
         lock.lock()
         defer { lock.unlock() }
         return receivedRuntimeIDs
+    }
+
+    var runtimeEventNames: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return receivedRuntimeNames
+    }
+
+    var runtimeEventStates: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return receivedTransportStates
+    }
+
+    var runtimeEventMetadata: [[String: String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return receivedTransportMetadata
     }
 
     func waitForConnectionCount(_ count: Int, timeout: TimeInterval) -> Bool {
@@ -288,8 +350,14 @@ private final class LoopbackTransportReceiver {
     private func process(_ frameData: Data, on connection: NWConnection, context: ConnectionContext) throws {
         let decoded = try BabylonProtocol.decode(frameData: frameData, configuration: configuration)
         if decoded.payload.messageType == .runtime {
+            let package = try JSONDecoder().decode(RuntimePackage.self, from: decoded.payload.content)
             lock.lock()
             receivedRuntimeIDs.append(decoded.frame.messageID)
+            receivedRuntimeNames.append(package.name)
+            if let transportState = package.metadata["transportState"] {
+                receivedTransportStates.append(transportState)
+                receivedTransportMetadata.append(package.metadata)
+            }
             let shouldDropAck = shouldDropFirstRuntimeAck && !didDropRuntimeAck
             if shouldDropAck {
                 didDropRuntimeAck = true
