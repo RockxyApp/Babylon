@@ -106,8 +106,8 @@ struct TransportRecoveryIntegrationTests {
         #expect(receiver.runtimeMessageIDs.isEmpty)
     }
 
-    @Test("Retry exhaustion state is delivered after the endpoint returns")
-    func retryExhaustionStateFlushesAfterRediscovery() throws {
+    @Test("Retry exhaustion state is delivered after the transport restarts")
+    func retryExhaustionStateFlushesAfterTransportRestart() throws {
         let configuration = testConfiguration()
         let receiver = try LoopbackTransportReceiver(configuration: configuration)
         defer { receiver.stop() }
@@ -128,9 +128,9 @@ struct TransportRecoveryIntegrationTests {
         #expect(waitUntil(timeout: 5) { transport.hasObservedConnectionFailureForTesting(endpoint) })
         #expect(waitUntil(timeout: 2) { !transport.hasScheduledRetryForTesting(endpoint) })
         try receiver.restart()
-        transport.updateDiscoveredEndpointForTesting(endpoint, discovered: false)
-        transport.updateDiscoveredEndpointForTesting(endpoint, discovered: true)
+        transport.startForTesting(configuration, endpoint: endpoint)
 
+        #expect(receiver.waitForConnectionCount(1, timeout: 3))
         #expect(receiver.waitForRuntimeFrameCount(1, timeout: 3))
         #expect(receiver.runtimeEventStates.suffix(2) == ["reconnecting", "retryExhausted"])
     }
