@@ -37,7 +37,7 @@ struct TransportRecoveryIntegrationTests {
         transport.startForTesting(configuration, endpoint: endpoint)
         #expect(receiver.waitForConnectionCount(1, timeout: 3))
 
-        receiver.stop()
+        #expect(receiver.stopAndWait())
         #expect(waitUntil(timeout: 4) { transport.hasScheduledRetryForTesting(endpoint) })
         transport.send(package: runtimeMessage(configuration: configuration, name: "queued-during-restart"))
 
@@ -112,7 +112,7 @@ struct TransportRecoveryIntegrationTests {
         let receiver = try LoopbackTransportReceiver(configuration: configuration)
         defer { receiver.stop() }
         let endpoint = receiver.endpoint
-        receiver.stop()
+        #expect(receiver.stopAndWait())
 
         let transport = NetServiceTransport(
             reconnectPolicy: BoundedRetryPolicy(
@@ -252,6 +252,11 @@ private final class LoopbackTransportReceiver {
     }
 
     func stop() {
+        _ = stopAndWait()
+    }
+
+    @discardableResult
+    func stopAndWait(timeout: TimeInterval = 2) -> Bool {
         lock.lock()
         let currentListener = listener
         let currentConnections = connections
@@ -260,6 +265,8 @@ private final class LoopbackTransportReceiver {
         lock.unlock()
         currentListener?.cancel()
         currentConnections.forEach { $0.cancel() }
+        guard let currentListener else { return true }
+        return waitUntil(timeout: timeout) { currentListener.state == .cancelled }
     }
 
     func restart() throws {
