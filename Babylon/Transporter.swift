@@ -114,6 +114,7 @@ final class TransportState {
     var drainDeadlineToken: UUID?
     var isDraining = false
     var didSendDrainCompletion = false
+    var drainHadUndeliveredPackages = false
 
     func nextSequence() -> UInt64 {
         defer { sequence &+= 1 }
@@ -168,11 +169,13 @@ final class TransportState {
     }
 
     @discardableResult
-    func removeRetained(_ messageID: String) -> Bool {
+    func removeRetained(_ messageID: String, acknowledged: Bool = false) -> Bool {
         guard let frame = retained.removeValue(forKey: messageID) else { return false }
         retainedOrder.removeAll { $0 == messageID }
         retainedBytes -= frame.encoded.payload.count
-        drainingMessageIDs.remove(messageID)
+        if drainingMessageIDs.remove(messageID) != nil, !acknowledged {
+            drainHadUndeliveredPackages = true
+        }
         return true
     }
 
@@ -196,6 +199,7 @@ final class TransportState {
         drainDeadlineToken = nil
         isDraining = false
         didSendDrainCompletion = false
+        drainHadUndeliveredPackages = false
         configuration = nil
         if clearPending {
             pending.removeAll()
@@ -293,6 +297,10 @@ final class NetServiceTransport: NSObject, Transporter {
         queue.sync { state.endpointRetryTokens[endpoint] != nil }
     }
 
+    func hasUndeliveredDrainPackagesForTesting() -> Bool {
+        queue.sync { state.drainHadUndeliveredPackages }
+    }
+
     func stop() {
         queue.async { [weak self] in
             guard let self else { return }
@@ -311,7 +319,9 @@ final class NetServiceTransport: NSObject, Transporter {
             }
             state.isDraining = true
             let drainEvent: [Serializable] = transportEvent("draining").map { [$0] } ?? []
-            state.drainPending = state.boundedDrainPackages(drainEvent + packages)
+            let selectedPackages = state.boundedDrainPackages(packages)
+            state.drainHadUndeliveredPackages = selectedPackages.count < packages.count
+            state.drainPending = state.boundedDrainPackages(drainEvent + selectedPackages)
             browser?.cancel()
             browser = nil
             let token = UUID()
@@ -703,10 +713,16 @@ private extension NetServiceTransport {
                   sequence: state.nextSequence()
               ) else {
             logger.error("Could not encode an outgoing package")
+            if isClosingPackage {
+                state.drainHadUndeliveredPackages = true
+            }
             finishDrainIfComplete()
             return
         }
         guard retain(encoded) else {
+            if isClosingPackage {
+                state.drainHadUndeliveredPackages = true
+            }
             finishDrainIfComplete()
             return
         }
@@ -836,7 +852,7 @@ private extension NetServiceTransport {
                     logger.error("Rejected a malformed acknowledgement")
                     return
                 }
-                if state.removeRetained(acknowledgement.messageID) {
+                if state.removeRetained(acknowledgement.messageID, acknowledged: true) {
                     state.drainingMessageIDs.remove(acknowledgement.messageID)
                     finishDrainIfComplete()
                 }
@@ -874,7 +890,10 @@ private extension NetServiceTransport {
     }
 
     func finishDrainIfComplete() {
-        guard state.isDraining, state.drainPending.isEmpty, state.drainingMessageIDs.isEmpty else { return }
+        guard state.isDraining,
+              state.drainPending.isEmpty,
+              state.drainingMessageIDs.isEmpty,
+              !state.drainHadUndeliveredPackages else { return }
         guard !state.didSendDrainCompletion else {
             finishDrain()
             return

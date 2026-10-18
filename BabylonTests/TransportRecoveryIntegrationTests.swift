@@ -155,6 +155,27 @@ struct TransportRecoveryIntegrationTests {
         #expect(receiver.runtimeMessageIDs.count == 3)
     }
 
+    @Test("Graceful shutdown does not report completion when closing messages are not acknowledged")
+    func gracefulShutdownDoesNotCompleteAfterAcknowledgementLoss() throws {
+        let configuration = testConfiguration()
+        let receiver = try LoopbackTransportReceiver(configuration: configuration, dropsRuntimeAcks: true)
+        defer { receiver.stop() }
+        let transport = NetServiceTransport()
+        defer { transport.stop() }
+        transport.startForTesting(configuration, endpoint: receiver.endpoint)
+        #expect(receiver.waitForConnectionCount(1, timeout: 3))
+
+        transport.stop(
+            afterSending: [runtimeMessage(configuration: configuration, name: "trace-finished")],
+            deadline: 8
+        )
+
+        #expect(receiver.waitForRuntimeFrameCount(2, timeout: 3))
+        #expect(waitUntil(timeout: 7) { transport.hasUndeliveredDrainPackagesForTesting() })
+        #expect(receiver.runtimeEventStates.contains("draining"))
+        #expect(!receiver.runtimeEventStates.contains("drainCompleted"))
+    }
+
     private func testConfiguration() -> Configuration {
         Configuration(
             projectName: "Transport recovery tests",
@@ -204,12 +225,18 @@ private final class LoopbackTransportReceiver {
     private var receivedTransportMetadata: [[String: String]] = []
     private var acceptedConnectionCount = 0
     private var shouldDropFirstRuntimeAck: Bool
+    private let dropsRuntimeAcks: Bool
     private var didDropRuntimeAck = false
     private(set) var endpoint: NWEndpoint
 
-    init(configuration: Configuration, dropsFirstRuntimeAck: Bool = false) throws {
+    init(
+        configuration: Configuration,
+        dropsFirstRuntimeAck: Bool = false,
+        dropsRuntimeAcks: Bool = false
+    ) throws {
         self.configuration = configuration
         shouldDropFirstRuntimeAck = dropsFirstRuntimeAck
+        self.dropsRuntimeAcks = dropsRuntimeAcks
         guard let port = NWEndpoint.Port(rawValue: 0) else { throw LoopbackReceiverError.startTimedOut }
         endpoint = .hostPort(host: NWEndpoint.Host("127.0.0.1"), port: port)
         try startListener(on: port)
@@ -365,9 +392,9 @@ private final class LoopbackTransportReceiver {
                 receivedTransportStates.append(transportState)
                 receivedTransportMetadata.append(package.metadata)
             }
-            let shouldDropAck = shouldDropFirstRuntimeAck && !didDropRuntimeAck
+            let shouldDropAck = dropsRuntimeAcks || (shouldDropFirstRuntimeAck && !didDropRuntimeAck)
             if shouldDropAck {
-                didDropRuntimeAck = true
+                didDropRuntimeAck = didDropRuntimeAck || shouldDropFirstRuntimeAck
             }
             lock.unlock()
             if shouldDropAck {
