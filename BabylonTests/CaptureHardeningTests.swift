@@ -35,7 +35,7 @@ struct CaptureHardeningTests {
 
     @Test("Oversized WebSocket data is replaced before encoding")
     func websocketBodyIsBoundedDuringCapture() throws {
-        let oversized = Data(repeating: 0x42, count: BabylonConstants.maximumBodySize + 1)
+        let oversized = Data(repeating: 0x42, count: BabylonConstants.maximumWebSocketFrameSize + 1)
         let package = WebsocketMessagePackage(id: "ws", message: .data(oversized), messageType: .send)
         let encoded = try #require(package.toData())
         let json = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])

@@ -51,6 +51,11 @@ public extension Babylon {
         case bidirectional
     }
 
+    @available(
+        *,
+        deprecated,
+        message: "Use addGRPCCall with endpoint, call type, metadata, trailers, status, compression, and ordered messages."
+    )
     class func addGRPCUnary(
         path: String,
         requestObject: Data?,
@@ -63,25 +68,95 @@ public extension Babylon {
         HPACKHeadersRequest: [Header] = [],
         HPACKHeadersResponse: [Header] = []
     ) {
+        let (service, method) = grpcOperation(from: path)
+        addGRPCCall(
+            endpoint: path,
+            service: service,
+            method: method,
+            callType: .unary,
+            requestMetadata: HPACKHeadersRequest,
+            responseMetadata: HPACKHeadersResponse,
+            trailers: grpcTrailers(statusCode: statusCode, statusMessage: statusMessage),
+            statusCode: statusCode,
+            statusMessage: statusMessage,
+            messages: [
+                GRPCCapture.Message(sequence: 0, direction: .request, data: requestObject),
+                GRPCCapture.Message(sequence: 0, direction: .response, data: responseObject)
+            ].filter { $0.data != nil },
+            startedAt: startedAt,
+            endedAt: endedAt
+        )
+    }
+
+    /// Records one bounded gRPC call while keeping its RPC identity separate from its network endpoint.
+    ///
+    /// Protobuf message bytes remain opaque. The SDK preserves message boundaries and direction, and applies
+    /// its configured capture bounds before retaining or serializing the messages.
+    /// - Parameters:
+    ///   - endpoint: Absolute URL or endpoint string used for the network request.
+    ///   - service: Fully qualified gRPC service name, such as `example.Greeter`.
+    ///   - method: RPC method name, such as `SayHello`.
+    ///   - authority: Optional HTTP/2 authority used by the call.
+    ///   - callType: Unary, client-streaming, server-streaming, or bidirectional-streaming.
+    ///   - messages: Request and response messages in their capture order.
+    class func addGRPCCall(
+        id: UUID? = nil,
+        endpoint: String,
+        service: String,
+        method: String,
+        authority: String? = nil,
+        callType: GRPCCapture.CallType,
+        requestMetadata: [Header] = [],
+        responseMetadata: [Header] = [],
+        trailers: [Header] = [],
+        statusCode: Int? = nil,
+        statusMessage: String? = nil,
+        requestCompression: String? = nil,
+        responseCompression: String? = nil,
+        messages: [GRPCCapture.Message],
+        startedAt: Date? = nil,
+        endedAt: Date? = nil
+    ) {
         enqueueManualCapture { context in
             let package = TrafficPackage(
-                id: UUID().uuidString,
-                request: Request(url: path, method: "GRPC", headers: HPACKHeadersRequest, body: requestObject),
-                response: grpcResponse(
-                    success: success,
-                    statusCode: statusCode,
-                    statusMessage: statusMessage,
-                    metadata: HPACKHeadersResponse
+                id: id?.uuidString ?? UUID().uuidString,
+                request: Request(
+                    url: endpoint,
+                    method: "POST",
+                    headers: requestMetadata,
+                    body: messages.first(where: { $0.direction == .request })?.data
                 ),
-                responseBodyData: responseObject,
+                response: statusCode.map { _ in Response(statusCode: 200, headers: responseMetadata + trailers) },
+                responseBodyData: messages.first(where: { $0.direction == .response })?.data,
+                packageType: .grpc,
                 startAt: startedAt?.timeIntervalSince1970 ?? Date().timeIntervalSince1970,
                 endAt: endedAt?.timeIntervalSince1970,
                 correlationContext: context
             )
+            package.setGRPCCapture(GRPCCapture(
+                endpoint: endpoint,
+                authority: authority,
+                service: service,
+                method: method,
+                callType: callType,
+                requestMetadata: requestMetadata,
+                responseMetadata: responseMetadata,
+                trailers: trailers,
+                statusCode: statusCode,
+                statusMessage: statusMessage,
+                requestCompression: requestCompression,
+                responseCompression: responseCompression,
+                messages: messages
+            ))
             Babylon.shared.startSendingMessage(package: package)
         }
     }
 
+    @available(
+        *,
+        deprecated,
+        message: "Use addGRPCCall with endpoint, call type, metadata, trailers, status, compression, and ordered messages."
+    )
     class func addGRPCStreaming(
         id: UUID,
         path: String,
@@ -96,55 +171,55 @@ public extension Babylon {
         HPACKHeadersRequest: [Header] = [],
         HPACKHeadersResponse: [Header] = []
     ) {
-        enqueueManualCapture { context in
-            let identifier = id.uuidString
-            let outgoingBody: Data? = streamingType == .server ? message.optionalData : nil
-            let responseBody: Data? = streamingType == .client ? message.optionalData : nil
-            let package = TrafficPackage(
-                id: identifier,
-                request: Request(url: path, method: "GRPC", headers: HPACKHeadersRequest, body: outgoingBody),
-                response: grpcResponse(
-                    success: success,
-                    statusCode: statusCode,
-                    statusMessage: statusMessage,
-                    metadata: HPACKHeadersResponse
-                ),
-                responseBodyData: responseBody,
-                packageType: .websocket,
-                startAt: startedAt?.timeIntervalSince1970 ?? Date().timeIntervalSince1970,
-                endAt: endedAt?.timeIntervalSince1970,
-                correlationContext: context
-            )
-
-            let shouldAttachFrame = type != .send || streamingType != .server
-            if shouldAttachFrame {
-                package.setWebsocketMessagePackage(package: WebsocketMessagePackage(
-                    id: identifier,
-                    message: message,
-                    messageType: type
-                ))
-            }
-            Babylon.shared.startSendingWebsocketMessage(package)
+        let callType: GRPCCapture.CallType = switch streamingType {
+        case .client: .clientStreaming
+        case .server: .serverStreaming
+        case .bidirectional: .bidirectionalStreaming
         }
+        let direction: GRPCCapture.Direction = type == .send ? .request : .response
+        let payload: Data? = switch message {
+        case let .data(data): data
+        case let .string(value): Data(value.utf8)
+        }
+        let (service, method) = grpcOperation(from: path)
+        addGRPCCall(
+            id: id,
+            endpoint: path,
+            service: service,
+            method: method,
+            callType: callType,
+            requestMetadata: HPACKHeadersRequest,
+            responseMetadata: HPACKHeadersResponse,
+            trailers: grpcTrailers(statusCode: statusCode, statusMessage: statusMessage),
+            statusCode: statusCode,
+            statusMessage: statusMessage,
+            messages: [GRPCCapture.Message(
+                sequence: 0,
+                direction: direction,
+                data: payload
+            )],
+            startedAt: startedAt,
+            endedAt: endedAt
+        )
+    }
+
+    private class func grpcTrailers(statusCode: Int, statusMessage: String?) -> [Header] {
+        var result = [Header(key: "grpc-status", value: String(statusCode))]
+        if let statusMessage {
+            result.append(Header(key: "grpc-message", value: statusMessage))
+        }
+        return result
+    }
+
+    private class func grpcOperation(from endpoint: String) -> (service: String, method: String) {
+        let path = URLComponents(string: endpoint)?.path ?? endpoint
+        let parts = path.split(separator: "/")
+        guard let method = parts.last else { return ("", endpoint) }
+        return (parts.dropLast().joined(separator: "/"), String(method))
     }
 
     private class func enqueueManualCapture(_ operation: @escaping (CorrelationContext?) -> Void) {
         Babylon.shared.scheduleManualCapture(operation)
-    }
-
-    private class func grpcResponse(
-        success: Bool,
-        statusCode: Int,
-        statusMessage: String?,
-        metadata: [Header]
-    ) -> Response {
-        let statusDescription = GRPCStatusCode(rawValue: statusCode)?.description ?? "Unknown status Code \(statusCode)"
-        let diagnosticHeaders = [
-            Header(key: "success", value: String(success)),
-            Header(key: "statusCode", value: statusDescription),
-            Header(key: "statusMessage", value: statusMessage ?? "nil")
-        ]
-        return Response(statusCode: success ? 200 : 503, headers: diagnosticHeaders + metadata)
     }
 }
 
