@@ -105,6 +105,7 @@ final class TransportState {
     var retainedBytes = 0
     var endpointRetryWindows: [NWEndpoint: BoundedRetryWindow] = [:]
     var endpointRetryTokens: [NWEndpoint: UUID] = [:]
+    var endpointsWithConnectionFailures: Set<NWEndpoint> = []
     var discoveredEndpoints: Set<NWEndpoint> = []
     var discoveryRetryWindow: BoundedRetryWindow?
     var discoveryRetryToken: UUID?
@@ -112,6 +113,8 @@ final class TransportState {
     var drainingMessageIDs: Set<String> = []
     var drainDeadlineToken: UUID?
     var isDraining = false
+    var didSendDrainCompletion = false
+    var drainHadUndeliveredPackages = false
 
     func nextSequence() -> UInt64 {
         defer { sequence &+= 1 }
@@ -166,11 +169,13 @@ final class TransportState {
     }
 
     @discardableResult
-    func removeRetained(_ messageID: String) -> Bool {
+    func removeRetained(_ messageID: String, acknowledged: Bool = false) -> Bool {
         guard let frame = retained.removeValue(forKey: messageID) else { return false }
         retainedOrder.removeAll { $0 == messageID }
         retainedBytes -= frame.encoded.payload.count
-        drainingMessageIDs.remove(messageID)
+        if drainingMessageIDs.remove(messageID) != nil, !acknowledged {
+            drainHadUndeliveredPackages = true
+        }
         return true
     }
 
@@ -185,6 +190,7 @@ final class TransportState {
         intentionallyCancelledConnections.removeAll()
         endpointRetryWindows.removeAll()
         endpointRetryTokens.removeAll()
+        endpointsWithConnectionFailures.removeAll()
         discoveredEndpoints.removeAll()
         discoveryRetryWindow = nil
         discoveryRetryToken = nil
@@ -192,6 +198,8 @@ final class TransportState {
         drainingMessageIDs.removeAll()
         drainDeadlineToken = nil
         isDraining = false
+        didSendDrainCompletion = false
+        drainHadUndeliveredPackages = false
         configuration = nil
         if clearPending {
             pending.removeAll()
@@ -289,6 +297,14 @@ final class NetServiceTransport: NSObject, Transporter {
         queue.sync { state.endpointRetryTokens[endpoint] != nil }
     }
 
+    func hasObservedConnectionFailureForTesting(_ endpoint: NWEndpoint) -> Bool {
+        queue.sync { state.endpointsWithConnectionFailures.contains(endpoint) }
+    }
+
+    func hasUndeliveredDrainPackagesForTesting() -> Bool {
+        queue.sync { state.drainHadUndeliveredPackages }
+    }
+
     func stop() {
         queue.async { [weak self] in
             guard let self else { return }
@@ -306,7 +322,10 @@ final class NetServiceTransport: NSObject, Transporter {
                 return
             }
             state.isDraining = true
-            state.drainPending = state.boundedDrainPackages(packages)
+            let drainEvent: [Serializable] = transportEvent("draining").map { [$0] } ?? []
+            let selectedPackages = state.boundedDrainPackages(packages)
+            state.drainHadUndeliveredPackages = selectedPackages.count < packages.count
+            state.drainPending = state.boundedDrainPackages(drainEvent + selectedPackages)
             browser?.cancel()
             browser = nil
             let token = UUID()
@@ -437,6 +456,7 @@ private extension NetServiceTransport {
         state.discoveredEndpoints.remove(endpoint)
         state.endpointRetryWindows.removeValue(forKey: endpoint)
         state.endpointRetryTokens.removeValue(forKey: endpoint)
+        state.endpointsWithConnectionFailures.remove(endpoint)
         let matches = state.connections.filter { $0.endpoint == endpoint }
         for match in matches {
             state.intentionallyCancelledConnections.insert(ObjectIdentifier(match))
@@ -527,9 +547,13 @@ private extension NetServiceTransport {
         case .setup, .preparing:
             break
         case .ready:
+            let reconnected = state.endpointsWithConnectionFailures.remove(connection.endpoint) != nil
             state.endpointRetryWindows.removeValue(forKey: connection.endpoint)
             state.endpointRetryTokens.removeValue(forKey: connection.endpoint)
             sendIdentity(on: connection)
+            if reconnected {
+                enqueueTransportEvent("reconnected")
+            }
             flushPending()
             receive(on: connection, epoch: epoch)
         case let .waiting(error):
@@ -538,7 +562,11 @@ private extension NetServiceTransport {
             logger.error("Connection failed: \(Self.networkErrorCode(error), privacy: .public)")
             state.intentionallyCancelledConnections.remove(ObjectIdentifier(connection))
             state.detach(connection)
-            scheduleConnectionRetry(for: connection.endpoint, epoch: epoch)
+            scheduleConnectionRetry(
+                for: connection.endpoint,
+                epoch: epoch,
+                failureCode: Self.networkErrorCode(error)
+            )
         case .cancelled:
             let identity = ObjectIdentifier(connection)
             let wasIntentional = state.intentionallyCancelledConnections.remove(identity) != nil
@@ -558,10 +586,14 @@ private extension NetServiceTransport {
         state.intentionallyCancelledConnections.insert(ObjectIdentifier(connection))
         connection.cancel()
         state.detach(connection)
-        scheduleConnectionRetry(for: connection.endpoint, epoch: state.epoch)
+        scheduleConnectionRetry(
+            for: connection.endpoint,
+            epoch: state.epoch,
+            failureCode: Self.networkErrorCode(error)
+        )
     }
 
-    func scheduleConnectionRetry(for endpoint: NWEndpoint, epoch: UInt64) {
+    func scheduleConnectionRetry(for endpoint: NWEndpoint, epoch: UInt64, failureCode: String? = nil) {
         guard epoch == state.epoch,
               state.configuration?.hasValidAuthentication == true,
               !state.isDraining || state.drainDeadlineToken != nil else { return }
@@ -578,10 +610,19 @@ private extension NetServiceTransport {
         ) else {
             state.endpointRetryWindows.removeValue(forKey: endpoint)
             state.endpointRetryTokens.removeValue(forKey: endpoint)
+            state.endpointsWithConnectionFailures.insert(endpoint)
+            enqueueTransportEvent("retryExhausted", attempt: window.attempts, failureCode: failureCode)
             logger.error("Connection retry limit reached")
             return
         }
         state.endpointRetryWindows[endpoint] = window
+        state.endpointsWithConnectionFailures.insert(endpoint)
+        enqueueTransportEvent(
+            "reconnecting",
+            attempt: window.attempts,
+            delay: delay,
+            failureCode: failureCode
+        )
         let token = UUID()
         state.endpointRetryTokens[endpoint] = token
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -597,6 +638,42 @@ private extension NetServiceTransport {
             state.endpointRetryTokens.removeValue(forKey: endpoint)
             attach(NWConnection(to: endpoint, using: .tcp), epoch: epoch)
         }
+    }
+
+    func enqueueTransportEvent(
+        _ transportState: String,
+        attempt: Int? = nil,
+        delay: TimeInterval? = nil,
+        failureCode: String? = nil
+    ) {
+        guard let configuration = state.configuration else { return }
+        var metadata = ["transportState": transportState]
+        if let attempt {
+            metadata["retryAttempt"] = String(attempt)
+        }
+        if let delay, delay.isFinite, delay >= 0 {
+            metadata["retryDelayMilliseconds"] = String(Int((delay * 1000).rounded()))
+        }
+        if let failureCode {
+            metadata["networkError"] = failureCode
+        }
+        let package = RuntimePackage(
+            kind: .event,
+            sessionId: configuration.sessionID,
+            name: "Babylon transport \(transportState)",
+            metadata: metadata
+        )
+        state.enqueue(package, now: Date().timeIntervalSince1970)
+    }
+
+    func transportEvent(_ transportState: String) -> RuntimePackage? {
+        guard let configuration = state.configuration else { return nil }
+        return RuntimePackage(
+            kind: .event,
+            sessionId: configuration.sessionID,
+            name: "Babylon transport \(transportState)",
+            metadata: ["transportState": transportState]
+        )
     }
 
     static func networkErrorCode(_ error: NWError) -> String {
@@ -640,10 +717,16 @@ private extension NetServiceTransport {
                   sequence: state.nextSequence()
               ) else {
             logger.error("Could not encode an outgoing package")
+            if isClosingPackage {
+                state.drainHadUndeliveredPackages = true
+            }
             finishDrainIfComplete()
             return
         }
         guard retain(encoded) else {
+            if isClosingPackage {
+                state.drainHadUndeliveredPackages = true
+            }
             finishDrainIfComplete()
             return
         }
@@ -773,7 +856,7 @@ private extension NetServiceTransport {
                     logger.error("Rejected a malformed acknowledgement")
                     return
                 }
-                if state.removeRetained(acknowledgement.messageID) {
+                if state.removeRetained(acknowledgement.messageID, acknowledged: true) {
                     state.drainingMessageIDs.remove(acknowledgement.messageID)
                     finishDrainIfComplete()
                 }
@@ -811,8 +894,21 @@ private extension NetServiceTransport {
     }
 
     func finishDrainIfComplete() {
-        guard state.isDraining, state.drainPending.isEmpty, state.drainingMessageIDs.isEmpty else { return }
-        finishDrain()
+        guard state.isDraining,
+              state.drainPending.isEmpty,
+              state.drainingMessageIDs.isEmpty,
+              !state.drainHadUndeliveredPackages else { return }
+        guard !state.didSendDrainCompletion else {
+            finishDrain()
+            return
+        }
+        guard let completion = transportEvent("drainCompleted") else {
+            finishDrain()
+            return
+        }
+        state.didSendDrainCompletion = true
+        state.drainPending = [completion]
+        drainClosingPackages()
     }
 
     func finishDrain() {

@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Swift Package Index configuration for hosted DocC documentation and live compatibility badges
 - Task-scoped trace correlation with explicit context propagation for detached tasks and callbacks
 - Shared byte-budgeted capture, encoding, and encrypted transport buffers with bounded metadata and deterministic overload drops
-- Bounded transport reconnect retries and non-blocking graceful delivery of runtime events during shutdown
+- Bounded transport reconnect retries, visible reconnect/drain runtime events, and non-blocking graceful delivery of runtime events during shutdown
 - Session-scoped WebSocket capture policy, bounded upgrade-time buffering, and explicit ping, pong, and close lifecycle events
 - Immutable URLSession capture policy with pre-capture request filters, metadata-only mode, independent body limits, and bounded omission diagnostics
 - Bounded, versioned URLSession task timing for DNS, connection, TLS, server wait, response transfer, redirects, and connection reuse, without replacing caller delegate callbacks
