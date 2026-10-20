@@ -11,6 +11,9 @@ enum BabylonConstants {
     /// Maximum body size before truncation (50 MB).
     static let maximumBodySize = 52_428_800
 
+    /// Maximum single WebSocket frame accepted by Rockxy's receiver.
+    static let maximumWebSocketFrameSize = 10 * 1024 * 1024
+
     /// Shared ceiling for capture data retained across capture, encoding, and transport stages.
     static let maximumCaptureMemoryBytes = 536_870_912
 
@@ -31,6 +34,15 @@ enum BabylonConstants {
 
     /// Maximum number of unsent packages held in the pending queue.
     static let maxPendingItems = 50
+
+    /// Grace period for URLSession task metrics that Foundation reports after task completion.
+    static let urlSessionMetricsGracePeriod = DispatchTimeInterval.milliseconds(250)
+    static let maximumPendingMetricsCompletions = 50
+
+    /// Aggregate limits for WebSocket frames waiting for their upgrade transaction.
+    static let maximumDeferredWebSocketFrames = 256
+    static let maximumDeferredWebSocketBytes = 75_497_472
+    static let maximumDeferredWebSocketBytesPerTask = 50 * 1_048_576
 
     /// Maximum estimated bytes held by unsent network deliveries.
     static let maximumPendingBytes = 75_497_472
@@ -66,6 +78,8 @@ enum BabylonConstants {
         static let didReceiveResponseSniff = "_didReceiveResponse:sniff:"
         static let didReceiveData = "_didReceiveData:"
         static let didFinishWithError = "_didFinishWithError:"
+        static let didSendMetrics = "_didSendMetrics"
+        static let metrics = "_metrics"
         static let dataTaskWithRequest = "dataTaskWithRequest:"
         static let dataTaskWithRequestCompletion = "dataTaskWithRequest:completionHandler:"
         static let dataTaskWithURL = "dataTaskWithURL:"

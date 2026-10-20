@@ -246,6 +246,29 @@ Babylon.add(request: request, response: response, responseBody: jsonData)
 <details>
 <summary><strong>gRPC Unary Calls</strong></summary>
 
+New integrations should use the typed capture API. It keeps call metadata, trailers, status, compression, and each ordered message distinct. Protobuf bytes remain opaque; Babylon does not require generated protobuf types.
+
+```swift
+Babylon.addGRPCCall(
+    endpoint: "https://api.example.com/myapp.UserService/GetUser",
+    authority: "api.example.com",
+    service: "myapp.UserService",
+    method: "GetUser",
+    callType: .unary,
+    requestMetadata: [Header(key: "authorization", value: "Bearer ...")],
+    trailers: [Header(key: "grpc-status", value: "0")],
+    statusCode: 0,
+    messages: [
+        .init(sequence: 0, direction: .request, data: requestProtoData),
+        .init(sequence: 0, direction: .response, data: responseProtoData),
+    ],
+    startedAt: callStartDate,
+    endedAt: callEndDate
+)
+```
+
+`addGRPCUnary` and `addGRPCStreaming` remain available as deprecated adapters for source compatibility.
+
 ```swift
 Babylon.addGRPCUnary(
     path: "/myapp.UserService/GetUser",
@@ -367,8 +390,10 @@ Babylon.setIgnoreProtocols([MyCustomURLProtocol.self])
 
 | Method | Description |
 |--------|-------------|
-| `Babylon.start(authToken:hostName:shouldCaptureWebSocketTraffic:)` | Start capture with the Rockxy pairing token, optional exact hostname filter, and WebSocket toggle. |
+| `Babylon.start(authToken:hostName:shouldCaptureWebSocketTraffic:)` | Start capture with a pairing token and optional WebSocket capture. |
 | `Babylon.start(hostName:shouldCaptureWebSocketTraffic:)` | Start delegate-only capture. Network transport stays offline without a pairing token. |
+| `Babylon.start(authToken:hostName:shouldCaptureWebSocketTraffic:capturePolicy:)` | Start capture with a pairing token and immutable request/retention policy. |
+| `Babylon.start(hostName:shouldCaptureWebSocketTraffic:capturePolicy:)` | Start delegate-only capture with an immutable request/retention policy. |
 | `Babylon.stop()` | Stop capturing and disconnect from Rockxy. |
 | `Babylon.setDelegate(_:)` | Register a `BabylonDelegate` for in-process package delivery. |
 | `Babylon.setIgnoreProtocols(_:)` | Suppress duplicates from specified URLProtocol subclasses. |
@@ -385,6 +410,28 @@ Babylon.setIgnoreProtocols([MyCustomURLProtocol.self])
 | `Babylon.mark(_:metadata:)` | Add an instant runtime mark. |
 | `Babylon.event(_:metadata:)` | Add an application event to the active session. |
 | `Babylon.error(_:error:metadata:)` | Add an error event to the active session. |
+
+`CapturePolicy` rules are evaluated before Babylon creates a retained transaction. Exclude rules take
+precedence; when include rules exist, at least one must match. Fields inside a rule are combined with
+AND. Host suffixes match the exact host or a DNS subdomain boundary. Content-type rules are evaluated
+when response headers arrive and omit response bodies while retaining transaction metadata. Metadata-only
+mode removes request and response bodies. Per-direction limits are clamped to the package hard safety cap.
+Default credential header and query redaction remains active; custom redaction is additive.
+
+```swift
+#if DEBUG
+let policy = CapturePolicy(
+    rules: [
+        .init(action: .exclude, hostSuffixes: ["analytics.example.com"]),
+        .init(action: .include, schemes: ["https"], hostSuffixes: ["api.example.com"],
+              methods: ["GET", "POST"], pathPrefixes: ["/v1"])
+    ],
+    maximumRequestBodyBytes: 256 * 1024,
+    maximumResponseBodyBytes: 512 * 1024
+)
+Babylon.start(hostName: "Stephen’s Mac", capturePolicy: policy)
+#endif
+```
 
 ## Troubleshooting
 

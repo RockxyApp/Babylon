@@ -32,7 +32,11 @@ final class MockInjectorDelegate: InjectorDelegate {
         return CorrelatedURLRequest(request: request, correlationContext: nil)
     }
 
-    func injectorSessionDidCreateTask(task: URLSessionTask, correlationContext: CorrelationContext?) {
+    func injectorSessionDidCreateTask(
+        task: URLSessionTask,
+        correlationContext: CorrelationContext?,
+        capturePolicyDecision: CapturePolicyDecision = .included
+    ) {
         var args: [String: Any] = ["task": task]
         if let correlationContext {
             args["correlationContext"] = correlationContext
@@ -60,6 +64,10 @@ final class MockInjectorDelegate: InjectorDelegate {
         record("injectorSessionDidComplete", args)
     }
 
+    func injectorSessionDidCollectMetrics(task: URLSessionTask, metrics: URLSessionTaskMetrics) {
+        record("injectorSessionDidCollectMetrics", ["task": task, "metrics": metrics])
+    }
+
     func injectorSessionDidUpload(task: URLSessionTask, request: NSURLRequest, data: Data?) {
         var args: [String: Any] = ["task": task, "request": request]
         if let data {
@@ -76,8 +84,24 @@ final class MockInjectorDelegate: InjectorDelegate {
         record("injectorSessionWebSocketDidReceive", ["task": task, "message": message])
     }
 
+    func injectorSessionWebSocketWillReceive(task: URLSessionWebSocketTask) {
+        record("injectorSessionWebSocketWillReceive", ["task": task])
+    }
+
+    func injectorSessionWebSocketDidCompleteReceive(task: URLSessionWebSocketTask, error: Error?) {
+        record("injectorSessionWebSocketDidCompleteReceive", ["task": task, "error": error as Any])
+    }
+
+    func injectorSessionWebSocketDidReceiveClose(task: URLSessionWebSocketTask, error: Error) {
+        record("injectorSessionWebSocketDidReceiveClose", ["task": task, "error": error])
+    }
+
     func injectorSessionWebSocketDidSendPingPong(task: URLSessionTask) {
         record("injectorSessionWebSocketDidSendPingPong", ["task": task])
+    }
+
+    func injectorSessionWebSocketDidReceivePong(task: URLSessionTask) {
+        record("injectorSessionWebSocketDidReceivePong", ["task": task])
     }
 
     func injectorSessionWebSocketDidSendCancelWithReason(

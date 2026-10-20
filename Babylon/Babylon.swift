@@ -13,14 +13,21 @@ public protocol BabylonDelegate: AnyObject {
     func babylonDidCapturePackage(_ package: TrafficPackage)
 }
 
-private final class CaptureLedger {
+final class CaptureLedger {
+    private(set) var deferredFrameCount = 0
+    private(set) var deferredFrameBytes = 0
     var generation: UInt64 = 0
     var traffic: [String: TrafficPackage] = [:]
     var deferredFrames: [String: [WebsocketMessagePackage]] = [:]
     var deferredFrameLeases: [String: [CaptureMemoryLease]] = [:]
+    var localCloseTasks: Set<String> = []
+    var remoteCloseTasks: Set<String> = []
+    var pendingRemoteCloseTasks: Set<String> = []
+    var webSocketReceiveCounts: [String: Int] = [:]
     var ignored: Set<String> = []
     var startedAt: [String: TimeInterval] = [:]
     var taskGeneration: [String: UInt64] = [:]
+    var taskCaptureDecisions: [String: CapturePolicyDecision] = [:]
 
     func beginGeneration() {
         generation &+= 1
@@ -31,9 +38,16 @@ private final class CaptureLedger {
         traffic.removeAll()
         deferredFrames.removeAll()
         deferredFrameLeases.removeAll()
+        localCloseTasks.removeAll()
+        remoteCloseTasks.removeAll()
+        pendingRemoteCloseTasks.removeAll()
+        webSocketReceiveCounts.removeAll()
+        deferredFrameCount = 0
+        deferredFrameBytes = 0
         ignored.removeAll()
         startedAt.removeAll()
         taskGeneration.removeAll()
+        taskCaptureDecisions.removeAll()
     }
 
     func enroll(_ id: String) {
@@ -47,23 +61,68 @@ private final class CaptureLedger {
     }
 
     func deferFrame(_ frame: WebsocketMessagePackage, for id: String) {
-        var frames = deferredFrames[id, default: []]
-        let currentSize = frames.reduce(0) { $0 + $1.capturedBodySize }
+        var frames = deferredFrames[id] ?? []
+        let taskBytes = frames.reduce(0) { $0 + $1.captureMemoryEstimate }
         guard frames.count < BabylonConstants.maxPendingItems,
-              frame.capturedBodySize <= BabylonConstants.maximumBodySize - currentSize,
+              frame.captureMemoryEstimate <= BabylonConstants.maximumDeferredWebSocketBytesPerTask - taskBytes,
+              deferredFrameCount < BabylonConstants.maximumDeferredWebSocketFrames,
+              frame.captureMemoryEstimate <= BabylonConstants.maximumDeferredWebSocketBytes - deferredFrameBytes,
               let lease = CaptureMemoryBudget.shared.reserve(frame.captureMemoryEstimate) else {
             return
         }
         frames.append(frame)
         deferredFrames[id] = frames
         deferredFrameLeases[id, default: []].append(lease)
+        deferredFrameCount += 1
+        deferredFrameBytes += frame.captureMemoryEstimate
+    }
+
+    func takeDeferredFrames(for id: String) -> [WebsocketMessagePackage] {
+        guard let frames = deferredFrames.removeValue(forKey: id) else { return [] }
+        deferredFrameCount -= frames.count
+        deferredFrameBytes -= frames.reduce(0) { $0 + $1.captureMemoryEstimate }
+        deferredFrameLeases.removeValue(forKey: id)
+        return frames
+    }
+
+    func markLocalClose(for id: String) {
+        localCloseTasks.insert(id)
+    }
+
+    func markRemoteClose(for id: String) {
+        remoteCloseTasks.insert(id)
+    }
+
+    func beginWebSocketReceive(for id: String) {
+        webSocketReceiveCounts[id, default: 0] += 1
+    }
+
+    func completeWebSocketReceive(for id: String) {
+        let count = webSocketReceiveCounts[id, default: 0]
+        if count <= 1 {
+            webSocketReceiveCounts.removeValue(forKey: id)
+        } else {
+            webSocketReceiveCounts[id] = count - 1
+        }
+    }
+
+    func markPendingRemoteClose(for id: String) {
+        pendingRemoteCloseTasks.insert(id)
     }
 
     func forget(_ id: String) {
         traffic.removeValue(forKey: id)
-        deferredFrames.removeValue(forKey: id)
+        if let frames = deferredFrames.removeValue(forKey: id) {
+            deferredFrameCount -= frames.count
+            deferredFrameBytes -= frames.reduce(0) { $0 + $1.captureMemoryEstimate }
+        }
         deferredFrameLeases.removeValue(forKey: id)
+        localCloseTasks.remove(id)
+        remoteCloseTasks.remove(id)
+        pendingRemoteCloseTasks.remove(id)
+        webSocketReceiveCounts.removeValue(forKey: id)
         taskGeneration.removeValue(forKey: id)
+        taskCaptureDecisions.removeValue(forKey: id)
         ignored.remove(id)
         startedAt.removeValue(forKey: id)
     }
@@ -104,15 +163,48 @@ public final class Babylon: NSObject {
     let encodingQueue = BoundedCaptureWorkQueue(label: "com.amunx.babylon.encoding")
     private let encodingGeneration = Atomic<UInt64>(0)
     private let activeClientID = Atomic<String>("")
+    private let capturesWebSocketTraffic = Atomic<Bool>(false)
     private var ignoredProtocolClasses: [AnyClass] = []
     private let transportEnabled = Atomic<Bool>(true)
     private let playgroundMode = Atomic<Bool>(false)
     private let redactedHeaderKeys = Atomic<Set<String>>(Babylon.defaultRedactedHeaders)
     private let redactedQueryKeys = Atomic<Set<String>>(Babylon.defaultRedactedQueryItems)
+    private var capturePolicy = CapturePolicy()
+    private(set) var captureOmissions: [CaptureOmission] = []
+    private struct PendingWebSocketCompletion {
+        let task: URLSessionTask
+        let error: Error?
+    }
+
+    private struct PendingMetricsCompletion {
+        let workItem: DispatchWorkItem
+        let task: URLSessionTask
+        let error: Error?
+        let package: TrafficPackage
+    }
+
+    private var pendingWebSocketCompletions: [String: PendingWebSocketCompletion] = [:]
+    private var pendingMetricsCompletions: [String: PendingMetricsCompletion] = [:]
 
     private(set) var configuration = Configuration.default()
     let queue = DispatchQueue(label: "com.amunx.babylon")
     let traceContextStore = TraceContextStore()
+
+    var deferredWebSocketFrameCountForTesting: Int {
+        queue.sync { ledger.deferredFrameCount }
+    }
+
+    var pendingMetricsCompletionCountForTesting: Int {
+        queue.sync { pendingMetricsCompletions.count }
+    }
+
+    func trafficPackageForTesting(_ task: URLSessionTask) -> TrafficPackage? {
+        queue.sync { ledger.traffic[PackageIdentifier.getID(for: task)] }
+    }
+
+    func handleMemoryPressureForTesting() {
+        handleMemoryPressure()
+    }
 
     private override init() {
         transporter = NetServiceTransport()
@@ -122,8 +214,29 @@ public final class Babylon: NSObject {
     }
 
     @objc
-    public class func start(hostName: String? = nil, shouldCaptureWebSocketTraffic: Bool = true) {
-        activate(hostName: hostName, authToken: nil, capturesWebSockets: shouldCaptureWebSocketTraffic)
+    public class func start(
+        hostName: String? = nil,
+        shouldCaptureWebSocketTraffic: Bool = true
+    ) {
+        activate(
+            hostName: hostName,
+            authToken: nil,
+            capturesWebSockets: shouldCaptureWebSocketTraffic,
+            capturePolicy: CapturePolicy()
+        )
+    }
+
+    public class func start(
+        hostName: String? = nil,
+        shouldCaptureWebSocketTraffic: Bool = true,
+        capturePolicy: CapturePolicy
+    ) {
+        activate(
+            hostName: hostName,
+            authToken: nil,
+            capturesWebSockets: shouldCaptureWebSocketTraffic,
+            capturePolicy: capturePolicy
+        )
     }
 
     @objc(startWithAuthToken:hostName:shouldCaptureWebSocketTraffic:)
@@ -135,11 +248,31 @@ public final class Babylon: NSObject {
         activate(
             hostName: hostName,
             authToken: authToken,
-            capturesWebSockets: shouldCaptureWebSocketTraffic
+            capturesWebSockets: shouldCaptureWebSocketTraffic,
+            capturePolicy: CapturePolicy()
         )
     }
 
-    private class func activate(hostName: String?, authToken: String?, capturesWebSockets: Bool) {
+    public class func start(
+        authToken: String,
+        hostName: String? = nil,
+        shouldCaptureWebSocketTraffic: Bool = true,
+        capturePolicy: CapturePolicy
+    ) {
+        activate(
+            hostName: hostName,
+            authToken: authToken,
+            capturesWebSockets: shouldCaptureWebSocketTraffic,
+            capturePolicy: capturePolicy
+        )
+    }
+
+    private class func activate(
+        hostName: String?,
+        authToken: String?,
+        capturesWebSockets: Bool,
+        capturePolicy: CapturePolicy
+    ) {
         #if DEBUG
         let instance = Babylon.shared
         let newConfiguration = Configuration.default(hostName: hostName, authToken: authToken)
@@ -154,10 +287,14 @@ public final class Babylon: NSObject {
             guard isDiscoveryAvailable else { return }
         }
         guard isEnabled.compareExchange(expected: false, desired: true) else { return }
+        _ = instance.capturesWebSocketTraffic.exchange(capturesWebSockets)
 
         let sessionMessage = instance.queue.sync { () -> RuntimePackage? in
             instance.configuration = newConfiguration
+            instance.capturePolicy = capturePolicy
+            instance.captureOmissions.removeAll(keepingCapacity: true)
             _ = instance.activeClientID.exchange(newConfiguration.clientID)
+            instance.pendingWebSocketCompletions.removeAll()
             instance.ledger.beginGeneration()
             return instance.traceContextStore.startSession(
                 name: newConfiguration.projectName,
@@ -181,11 +318,17 @@ public final class Babylon: NSObject {
     public class func stop() {
         guard isEnabled.compareExchange(expected: true, desired: false) else { return }
         let instance = Babylon.shared
+        _ = instance.capturesWebSocketTraffic.exchange(false)
         let transport = instance.transporter
         _ = instance.activeClientID.exchange("")
         instance.invalidateEncodingWork()
         instance.queue.async {
             let configuration = instance.configuration
+            for pending in instance.pendingMetricsCompletions.values {
+                pending.workItem.cancel()
+                instance.completeCapturedTask(pending.task, error: pending.error, capture: pending.package)
+            }
+            instance.pendingMetricsCompletions.removeAll()
             let closingPackages = instance.traceContextStore.finishSession(
                 name: configuration.projectName,
                 metadata: [:]
@@ -194,7 +337,9 @@ public final class Babylon: NSObject {
                 ? closingPackages.compactMap { Message.buildRuntimeMessage(id: configuration.id, item: $0) }
                 : []
             instance.configuration = .default()
+            instance.capturePolicy = CapturePolicy()
             instance.ledger.clear()
+            instance.pendingWebSocketCompletions.removeAll()
             instance.traceContextStore.clear()
             transport.stop(
                 afterSending: closingMessages,
@@ -276,6 +421,11 @@ extension Babylon {
         redactedQueryKeys.value
     }
 
+    func recordCaptureOmission(reason: CapturePolicyDecision.OmissionReason, observedBytes: Int) {
+        guard captureOmissions.count < 256 else { return }
+        captureOmissions.append(CaptureOmission(reason: reason, observedBytes: observedBytes))
+    }
+
     func logHostRequirements() {
         if Babylon.isDiscoveryAvailable {
             Babylon.logger.info("Babylon (BabylonConstants.buildVersion) is active")
@@ -315,13 +465,34 @@ extension Babylon {
             return existing
         }
         guard let task = object as? URLSessionTask,
-              let request = task.currentRequestSafe,
-              let created = TrafficPackage.buildRequest(sessionTask: task, id: id) else {
+              let request = task.currentRequestSafe else {
             Babylon.logger.error("Unable to create capture package for \(String(describing: type(of: object)))")
             return nil
         }
-
+        let decision = ledger.taskCaptureDecisions[id] ?? capturePolicy.decision(for: request)
+        guard decision.included else {
+            recordCaptureOmission(reason: decision.reason ?? .rule, observedBytes: request.httpBody?.count ?? 0)
+            ledger.ignored.insert(id)
+            return nil
+        }
+        guard let created = TrafficPackage.buildRequest(
+            sessionTask: task,
+            id: id,
+            maximumRequestBodyBytes: capturePolicy.maximumRequestBodyBytes,
+            metadataOnly: capturePolicy.metadataOnly
+        ) else {
+            Babylon.logger.error("Unable to create capture package for \(String(describing: type(of: object)))")
+            return nil
+        }
         created.setCorrelationContext(traceContextStore.correlationContext(forPackageId: id))
+        created.configureCaptureLimits(
+            requestBytes: capturePolicy.maximumRequestBodyBytes,
+            responseBytes: capturePolicy.maximumResponseBodyBytes,
+            metadataOnly: capturePolicy.metadataOnly,
+            policy: capturePolicy,
+            request: request,
+            observedRequestBodyBytes: task.originalRequestBodySafe?.count ?? request.httpBody?.count
+        )
         if isIgnored(request, from: task) {
             ledger.ignored.insert(id)
             return nil
@@ -383,15 +554,30 @@ extension Babylon: InjectorDelegate {
         let scope = BabylonTraceScope.current
         return queue.sync {
             let context = Babylon.isEnabled.value ? traceContextStore.activeCorrelationContext(scope: scope) : nil
-            return CorrelatedURLRequest(request: request, correlationContext: context)
+            let decision = Babylon.isEnabled.value ? capturePolicy.decision(for: request) : .included
+            if !decision.included {
+                recordCaptureOmission(
+                    reason: decision.reason ?? .rule,
+                    observedBytes: min(request.httpBody?.count ?? 0, BabylonConstants.maximumBodySize * 1024)
+                )
+            }
+            return CorrelatedURLRequest(request: request, correlationContext: context, capturePolicyDecision: decision)
         }
     }
 
-    func injectorSessionDidCreateTask(task: URLSessionTask, correlationContext: CorrelationContext?) {
+    func injectorSessionDidCreateTask(
+        task: URLSessionTask,
+        correlationContext: CorrelationContext?,
+        capturePolicyDecision: CapturePolicyDecision = .included
+    ) {
         queue.sync {
             guard Babylon.isEnabled.value else { return }
             let id = PackageIdentifier.getID(for: task)
             ledger.enroll(id)
+            ledger.taskCaptureDecisions[id] = capturePolicyDecision
+            if !capturePolicyDecision.included {
+                ledger.ignored.insert(id)
+            }
             traceContextStore.setCorrelationContext(correlationContext, forPackageId: id)
         }
     }
@@ -417,6 +603,9 @@ extension Babylon: InjectorDelegate {
                 capture?.updateStartTime(timestamp)
             }
             capture?.updateResponse(response)
+            if (dataTask as? URLSessionWebSocketTask) != nil, capture?.response != nil {
+                flushWebSocketFrames(for: id)
+            }
         }
     }
 
@@ -428,7 +617,25 @@ extension Babylon: InjectorDelegate {
     }
 
     func injectorSessionDidComplete(task: URLSessionTask, error: Error?) {
+        if let webSocketTask = task as? URLSessionWebSocketTask,
+           error == nil,
+           webSocketTask.closeCode == .invalid {
+            return
+        }
         finish(task, error: error)
+    }
+
+    func injectorSessionDidCollectMetrics(task: URLSessionTask, metrics: URLSessionTaskMetrics) {
+        guard let timing = URLSessionTiming.capture(metrics) else { return }
+        queue.sync {
+            guard Babylon.isEnabled.value else { return }
+            let id = PackageIdentifier.getID(for: task)
+            guard let capture = package(for: task) else { return }
+            capture.setURLSessionTiming(timing)
+            guard let pending = pendingMetricsCompletions.removeValue(forKey: id) else { return }
+            pending.workItem.cancel()
+            completeCapturedTask(pending.task, error: pending.error, capture: pending.package)
+        }
     }
 
     func injectorSessionDidUpload(task: URLSessionTask, request: NSURLRequest, data: Data?) {
@@ -448,14 +655,75 @@ extension Babylon: InjectorDelegate {
 
 extension Babylon {
     func injectorSessionWebSocketDidSendPingPong(task: URLSessionTask) {
-        deliverWebSocket(task, kind: .pingPong, message: .string("ping"))
+        guard capturesWebSocketTraffic.value else { return }
+        deliverWebSocket(task, kind: .ping, message: .string("ping"))
+    }
+
+    func injectorSessionWebSocketDidReceivePong(task: URLSessionTask) {
+        guard capturesWebSocketTraffic.value else { return }
+        deliverWebSocket(task, kind: .pong, message: .string(""))
     }
 
     func injectorSessionWebSocketDidReceive(task: URLSessionTask, message: URLSessionWebSocketTask.Message) {
+        guard capturesWebSocketTraffic.value else { return }
         deliverWebSocket(task, kind: .receive, message: message)
     }
 
+    func injectorSessionWebSocketWillReceive(task: URLSessionWebSocketTask) {
+        queue.sync {
+            guard Babylon.isEnabled.value, capturesWebSocketTraffic.value else { return }
+            let id = PackageIdentifier.getID(for: task)
+            ledger.beginWebSocketReceive(for: id)
+        }
+    }
+
+    func injectorSessionWebSocketDidCompleteReceive(task: URLSessionWebSocketTask, error: Error?) {
+        let pendingCompletion = queue.sync { () -> PendingWebSocketCompletion? in
+            guard Babylon.isEnabled.value, capturesWebSocketTraffic.value else { return nil }
+            let id = PackageIdentifier.getID(for: task)
+            ledger.completeWebSocketReceive(for: id)
+            if error != nil, !ledger.localCloseTasks.contains(id) {
+                ledger.markPendingRemoteClose(for: id)
+                return nil
+            }
+            guard ledger.webSocketReceiveCounts[id] == nil,
+                  !ledger.pendingRemoteCloseTasks.contains(id) else { return nil }
+            return pendingWebSocketCompletions.removeValue(forKey: id)
+        }
+        if let pendingCompletion {
+            finish(pendingCompletion.task, error: pendingCompletion.error)
+        }
+    }
+
+    func injectorSessionWebSocketDidReceiveClose(task: URLSessionWebSocketTask, error: Error) {
+        let pendingCompletion = queue.sync { () -> PendingWebSocketCompletion? in
+            guard Babylon.isEnabled.value, capturesWebSocketTraffic.value else { return nil }
+            let id = PackageIdentifier.getID(for: task)
+            if !ledger.localCloseTasks.contains(id) {
+                let closeCode = task.closeCode == .invalid ? nil : task.closeCode.rawValue
+                stageWebSocket(task) { id in
+                    WebsocketMessagePackage(
+                        id: id,
+                        closeCode: closeCode,
+                        reason: task.closeReason,
+                        origin: "remote",
+                        abnormal: closeCode == nil
+                    )
+                }
+                ledger.markRemoteClose(for: id)
+            }
+            ledger.pendingRemoteCloseTasks.remove(id)
+            return pendingWebSocketCompletions.removeValue(forKey: id)
+        }
+        if let pendingCompletion {
+            finish(pendingCompletion.task, error: pendingCompletion.error)
+        } else {
+            finish(task, error: error)
+        }
+    }
+
     func injectorSessionWebSocketDidSendMessage(task: URLSessionTask, message: URLSessionWebSocketTask.Message) {
+        guard capturesWebSocketTraffic.value else { return }
         deliverWebSocket(task, kind: .send, message: message)
     }
 
@@ -465,13 +733,20 @@ extension Babylon {
         reason: Data?
     ) {
         queue.sync {
-            guard Babylon.isEnabled.value else { return }
+            guard Babylon.isEnabled.value, capturesWebSocketTraffic.value else { return }
             stageWebSocket(task) { id in
-                WebsocketMessagePackage(id: id, closeCode: closeCode.rawValue, reason: reason)
+                if closeCode == .invalid {
+                    return WebsocketMessagePackage(
+                        id: id,
+                        closeCode: nil,
+                        reason: reason,
+                        origin: "local",
+                        abnormal: true
+                    )
+                }
+                return WebsocketMessagePackage(id: id, closeCode: closeCode.rawValue, reason: reason)
             }
-            let id = PackageIdentifier.getID(for: task)
-            ledger.forget(id)
-            traceContextStore.removeCorrelationContext(forPackageId: id)
+            ledger.markLocalClose(for: PackageIdentifier.getID(for: task))
         }
     }
 
@@ -480,8 +755,9 @@ extension Babylon {
         kind: WebsocketMessagePackage.MessageType,
         message: URLSessionWebSocketTask.Message
     ) {
+        guard capturesWebSocketTraffic.value else { return }
         queue.sync {
-            guard Babylon.isEnabled.value else { return }
+            guard Babylon.isEnabled.value, capturesWebSocketTraffic.value else { return }
             stageWebSocket(task) { id in
                 guard let payload = WebsocketMessagePackage.Message(message: message) else { return nil }
                 return WebsocketMessagePackage(id: id, message: payload, messageType: kind)
@@ -494,7 +770,12 @@ extension Babylon {
         builder: (String) -> WebsocketMessagePackage?
     ) {
         let id = PackageIdentifier.getID(for: task)
-        guard let parent = ledger.traffic[id], let frame = builder(id) else { return }
+        guard let frame = builder(id) else { return }
+        guard let parent = ledger.traffic[id] else {
+            ledger.deferFrame(frame, for: id)
+            ledger.enroll(id)
+            return
+        }
         if parent.response == nil {
             ledger.deferFrame(frame, for: id)
         } else {
@@ -535,10 +816,8 @@ extension Babylon {
     }
 
     private func flushWebSocketFrames(for id: String) {
-        guard transportEnabled.value else { return }
-        guard let frames = ledger.deferredFrames.removeValue(forKey: id),
-              let parent = ledger.traffic[id] else { return }
-        ledger.deferredFrameLeases.removeValue(forKey: id)
+        guard let parent = ledger.traffic[id] else { return }
+        let frames = ledger.takeDeferredFrames(for: id)
         for frame in frames {
             parent.setWebsocketMessagePackage(package: frame)
             enqueueTrafficSnapshot(parent, type: .websocket)
@@ -580,17 +859,76 @@ extension Babylon {
     private func finish(_ task: AnyObject, error: Error?) {
         queue.sync {
             let id = PackageIdentifier.getID(for: task)
-            defer {
-                ledger.forget(id)
-                traceContextStore.removeCorrelationContext(forPackageId: id)
+            if ledger.pendingRemoteCloseTasks.contains(id) || ledger.webSocketReceiveCounts[id] != nil {
+                guard let task = task as? URLSessionTask else { return }
+                pendingWebSocketCompletions[id] = PendingWebSocketCompletion(task: task, error: error)
+                return
             }
+            guard pendingMetricsCompletions[id] == nil else { return }
             guard Babylon.isEnabled.value, let capture = package(for: task, completing: true) else { return }
             capture.updateDidComplete(error)
-            startSendingMessage(package: capture)
-
-            if capture.packageType == .websocket {
-                flushWebSocketFrames(for: capture.id)
+            if capture.packageType == .http,
+               capture.urlSessionTiming == nil,
+               pendingMetricsCompletions.count < BabylonConstants.maximumPendingMetricsCompletions,
+               let sessionTask = task as? URLSessionTask {
+                scheduleMetricsCompletion(for: sessionTask, error: error, package: capture, id: id)
+                return
             }
+            completeCapturedTask(task, error: error, capture: capture)
+        }
+    }
+
+    private func scheduleMetricsCompletion(
+        for task: URLSessionTask,
+        error: Error?,
+        package: TrafficPackage,
+        id: String
+    ) {
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, let pending = pendingMetricsCompletions.removeValue(forKey: id) else { return }
+            completeCapturedTask(pending.task, error: pending.error, capture: pending.package)
+        }
+        pendingMetricsCompletions[id] = PendingMetricsCompletion(
+            workItem: workItem,
+            task: task,
+            error: error,
+            package: package
+        )
+        queue.asyncAfter(deadline: .now() + BabylonConstants.urlSessionMetricsGracePeriod, execute: workItem)
+    }
+
+    private func completeCapturedTask(_ task: AnyObject, error: Error?, capture: TrafficPackage) {
+        let id = PackageIdentifier.getID(for: task)
+        defer {
+            ledger.forget(id)
+            traceContextStore.removeCorrelationContext(forPackageId: id)
+        }
+        if capturesWebSocketTraffic.value,
+           capture.packageType == .websocket,
+           let webSocketTask = task as? URLSessionWebSocketTask,
+           !ledger.localCloseTasks.contains(capture.id),
+           !ledger.remoteCloseTasks.contains(capture.id) {
+            let closeCode = webSocketTask.closeCode.rawValue == URLSessionWebSocketTask.CloseCode.invalid.rawValue
+                ? nil
+                : webSocketTask.closeCode.rawValue
+            let abnormal = error != nil && closeCode == nil
+            if error != nil || closeCode != nil {
+                let reason = webSocketTask.closeReason
+                stageWebSocket(webSocketTask) { id in
+                    WebsocketMessagePackage(
+                        id: id,
+                        closeCode: closeCode,
+                        reason: reason,
+                        origin: "remote",
+                        abnormal: abnormal
+                    )
+                }
+            }
+        }
+        startSendingMessage(package: capture)
+
+        if capture.packageType == .websocket {
+            flushWebSocketFrames(for: capture.id)
         }
     }
 }
@@ -616,6 +954,8 @@ private extension Babylon {
     func handleMemoryPressure() {
         queue.async { [weak self] in
             guard let self else { return }
+            pendingMetricsCompletions.values.forEach { $0.workItem.cancel() }
+            pendingMetricsCompletions.removeAll()
             ledger.traffic.keys.forEach { self.traceContextStore.removeCorrelationContext(forPackageId: $0) }
             ledger.clear()
             invalidateEncodingWork()

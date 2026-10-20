@@ -33,8 +33,9 @@ exactly one trace is active; when multiple traces overlap, Babylon leaves the co
 
 ### Lifecycle
 
-- ``Babylon/start(authToken:hostName:shouldCaptureWebSocketTraffic:)``
-- ``Babylon/start(hostName:shouldCaptureWebSocketTraffic:)``
+- ``Babylon/start(authToken:hostName:shouldCaptureWebSocketTraffic:capturePolicy:)``
+- ``Babylon/start(hostName:shouldCaptureWebSocketTraffic:capturePolicy:)``
+- ``CapturePolicy``
 - ``Babylon/stop()``
 
 ### Capture configuration

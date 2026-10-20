@@ -6,11 +6,87 @@ on:
   push:
     branches:
       - main
+  schedule:
+    - cron: '23 9 * * 1'
 
 permissions:
   contents: read
 
 jobs:
+  simulator-platform-builds:
+    name: Build ${{ matrix.platform }} simulator
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: iOS
+            triple: arm64-apple-ios16.0-simulator
+            sdk: iphonesimulator
+          - platform: tvOS
+            triple: arm64-apple-tvos16.0-simulator
+            sdk: appletvsimulator
+          - platform: watchOS
+            triple: arm64-apple-watchos10.0-simulator
+            sdk: watchsimulator
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # immutable commit allowed by repository policy
+
+      - name: Build Swift package for ${{ matrix.platform }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TRIPLE: ${{ matrix.triple }}
+          SDK_NAME: ${{ matrix.sdk }}
+        run: >-
+          swift build
+          --disable-index-store
+          --build-path "$RUNNER_TEMP/babylon-${PLATFORM}"
+          --triple "$TRIPLE"
+          --sdk "$(xcrun --sdk "$SDK_NAME" --show-sdk-path)"
+
+  scheduled-hardening:
+    if: github.event_name == 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        lane:
+          - strict-concurrency
+          - address-sanitizer
+          - thread-sanitizer
+          - capture-rss
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # immutable commit allowed by repository policy
+
+      - name: Run weekly ${{ matrix.lane }} verification
+        env:
+          LANE: ${{ matrix.lane }}
+          CAPTURE_FILTER: CaptureHardeningTests|CapturePolicyTests|WebSocketCaptureLifecycleTests|WebSocketLoopbackIntegrationTests|BabylonLifecycleTests
+        run: |
+          case "$LANE" in
+            strict-concurrency)
+              swift build --disable-index-store --build-path "$RUNNER_TEMP/babylon-strict-concurrency" \
+                -Xswiftc -strict-concurrency=complete
+              ;;
+            address-sanitizer)
+              swift test --no-parallel --sanitize=address --filter "$CAPTURE_FILTER"
+              ;;
+            thread-sanitizer)
+              swift test --no-parallel --sanitize=thread --filter "$CAPTURE_FILTER"
+              ;;
+            capture-rss)
+              /usr/bin/time -l swift test --no-parallel --filter "$CAPTURE_FILTER"
+              ;;
+            *)
+              echo "Unknown verification lane: $LANE" >&2
+              exit 2
+              ;;
+          esac
+
   validate:
     runs-on: macos-15
     timeout-minutes: 30
@@ -84,5 +160,16 @@ jobs:
           -scheme Babylon
           -configuration Release
           -destination 'generic/platform=iOS'
+          -derivedDataPath "$RUNNER_TEMP/babylon-release"
           CODE_SIGNING_ALLOWED=NO
           build
+
+      - name: Verify Release framework excludes private URLSession hooks
+        run: |
+          binary="$RUNNER_TEMP/babylon-release/Build/Products/Release-iphoneos/Babylon.framework/Babylon"
+          test -f "$binary"
+          if nm -a "$binary" | grep -Eq '_swizzleURLSession|_didReceiveResponse:sniff:|_didCompleteWithError:'; then
+            echo "Private URLSession hook symbols are present in the Release framework."
+            exit 1
+          fi
+          echo "Release framework contains no private URLSession hook symbols."
