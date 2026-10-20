@@ -46,13 +46,14 @@ struct TransportRecoveryIntegrationTests {
         #expect(receiver.runtimeEventStates.contains("reconnecting"))
         #expect(receiver.runtimeEventStates.contains("reconnected"))
         #expect(receiver.runtimeEventNames.contains("queued-during-restart"))
+        #expect(receiver.runtimeEventNames.filter { $0 == "queued-during-restart" }.count == 1)
+        #expect(receiver.runtimeEventStates.filter { $0 == "reconnected" }.count == 1)
         let retryMetadata = try #require(receiver.runtimeEventMetadata.first { $0["transportState"] == "reconnecting" })
         #expect(retryMetadata["retryAttempt"] == "1")
         #expect(retryMetadata["retryDelayMilliseconds"] != nil)
         if let networkError = retryMetadata["networkError"] {
             #expect(["posix:", "dns:", "tls:", "other"].contains { networkError.hasPrefix($0) })
         }
-        #expect(receiver.runtimeMessageIDs.count == 3)
     }
 
     @Test("Endpoint removal cancels retries until rediscovery")
